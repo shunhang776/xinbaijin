@@ -48,7 +48,7 @@ jobs:
       - name: Compile Python source
         run: python -m compileall -q .
 
-         - name: Check undefined names (temporarily non-blocking)
+       - name: Check undefined names (temporarily non-blocking)
         continue-on-error: true
         run: >
           ruff check .
