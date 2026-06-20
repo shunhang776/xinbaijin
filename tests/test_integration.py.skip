@@ -1,0 +1,181 @@
+"""
+Phase 1 集成测试：__init__.py 33 导出完整性/跨模块一致性/导入性能。
+"""
+import importlib
+import time
+
+import pytest
+
+import core
+
+
+class TestAllExports:
+    """验证 __init__.py 的 33 个 __all__ 导出全部可用"""
+
+    def test_all_export_count(self):
+        assert len(core.__all__) == 33, f"Expected 33, got {len(core.__all__)}"
+
+    def test_every_export_is_importable(self):
+        missing = []
+        for name in core.__all__:
+            if not hasattr(core, name):
+                missing.append(name)
+        assert missing == [], f"Missing exports: {missing}"
+
+    @pytest.mark.parametrize("name", core.__all__)
+    def test_export_type(self, name):
+        obj = getattr(core, name)
+        assert obj is not None, f"core.{name} is None"
+
+    def test_import_time_under_one_second(self):
+        """import core 应该在 1 秒内完成（已加载不算）"""
+        # 重新加载测试
+        start = time.perf_counter()
+        importlib.reload(core)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 1.0, f"import core took {elapsed:.2f}s"
+
+
+class TestCrossModuleConsistency:
+    """跨模块一致性验证"""
+
+    def test_settings_and_constants_cache_aligned(self):
+        """settings 和 global_cache 默认值对齐"""
+        from core.constants import CACHE_DEFAULT_TTL, CACHE_MAX_SIZE
+        c = core.global_cache
+        assert c._default_ttl == CACHE_DEFAULT_TTL
+        assert c._max_size == CACHE_MAX_SIZE
+
+    def test_shutdown_constants_used(self):
+        """SHUTDOWN_DRAIN_TIMEOUT 被 container.stop_all 引用"""
+        from core.constants import SHUTDOWN_DRAIN_TIMEOUT
+        import inspect
+        sig = inspect.signature(core.container.stop_all)
+        assert sig.parameters["timeout"].default == SHUTDOWN_DRAIN_TIMEOUT
+
+    def test_is_shutting_down_exported(self):
+        assert callable(core.is_shutting_down)
+        assert core.is_shutting_down() is False
+
+    def test_circular_dependency_error_exported(self):
+        assert issubclass(core.CircularDependencyError, core.BaijinBaseError)
+
+    def test_utc_conversions_exported(self):
+        assert callable(core.utc_ts_to_bj)
+        assert callable(core.bj_ts_to_utc)
+
+    def test_convert_roundtrip(self):
+        """utc_ts_to_bj 和 bj_ts_to_utc 往返一致"""
+        import time as _time
+        utc_now = int(_time.time())
+        bj = core.utc_ts_to_bj(utc_now)
+        back = core.bj_ts_to_utc(bj)
+        assert back == utc_now
+
+    def test_enable_file_logging_config_wired(self):
+        """enable_file_logging 配置开关存在且默认开"""
+        assert hasattr(core.settings, "enable_file_logging")
+        assert core.settings.enable_file_logging is True
+
+    def test_container_timeout_constant_wired(self):
+        """container.stop_all 默认 timeout 引用常量"""
+        import inspect
+        from core.constants import SHUTDOWN_DRAIN_TIMEOUT
+        sig = inspect.signature(core.DependencyContainer.stop_all)
+        assert sig.parameters["timeout"].default == SHUTDOWN_DRAIN_TIMEOUT
+
+    def test_signal_handler_shutdown_timeout_referenced(self):
+        """SHUTDOWN_FORCE_TIMEOUT 在 signal_handler 中被引用"""
+        import inspect
+        src = inspect.getsource(__import__("core.signal_handler", fromlist=["install_signal_handlers"]))
+        assert "SHUTDOWN_FORCE_TIMEOUT" in src
+
+
+class TestNoCircularImports:
+    """验证 core 包内无循环导入"""
+
+    def test_all_core_modules_import_independently(self):
+        modules = [
+            "core.constants", "core.paths", "core.utils",
+            "core.types", "core.exceptions", "core.config",
+            "core.cache", "core.metrics", "core.logging",
+            "core.container", "core.signal_handler",
+        ]
+        for mod_name in modules:
+            # 每个模块都能独立导入
+            mod = importlib.import_module(mod_name)
+            assert mod is not None
+
+
+class TestReimportIdempotency:
+    """重复导入不崩溃"""
+
+    def test_reimport_core(self):
+        importlib.reload(core)
+
+    def test_reimport_all_submodules(self):
+        modules = [
+            "core.constants", "core.paths", "core.utils",
+            "core.types", "core.exceptions", "core.config",
+            "core.cache", "core.metrics", "core.logging",
+            "core.container", "core.signal_handler",
+        ]
+        for mod_name in modules:
+            mod = importlib.import_module(mod_name)
+            importlib.reload(mod)
+
+
+class TestDesignConstraints:
+    """Phase 1 设计指标验证"""
+
+    def test_facade_no_bypass(self):
+        """外部模块不能 import core.submodule，只能 from core import X"""
+        import subprocess, sys
+        r = subprocess.run(
+            [sys.executable, "scripts/ops/lint_imports.py", "--strict", "core/"],
+            capture_output=True, text=True,
+        )
+        assert r.returncode == 0, f"Lint failed: {r.stdout}"
+
+    def test_all_dtos_frozen(self):
+        """所有 DTO 不可变"""
+        import dataclasses
+        from core.types import (
+            Result, PromptData, MemoryItem,
+            HealthStatus, MetricsSnapshot, TraceContext,
+        )
+        dtos = [
+            Result(ok=True),
+            PromptData(),
+            MemoryItem(id="1", content="test"),
+            HealthStatus(),
+            MetricsSnapshot(),
+            TraceContext(),
+        ]
+        for dto in dtos:
+            assert dataclasses.is_dataclass(dto)
+            # frozen dataclass 的 __dataclass_params__ 有 frozen=True
+            # 但 is_dataclass 不检查 frozen，用 __setattr__ 测试
+            first_field = list(dto.__dataclass_fields__.keys())[0]
+            try:
+                setattr(dto, first_field, getattr(dto, first_field))
+                pytest.fail(f"{type(dto).__name__} not frozen")
+            except dataclasses.FrozenInstanceError:
+                pass
+
+    def test_all_rlock_no_plain_lock(self):
+        """所有 core 模块的锁都是 RLock，无 plain Lock"""
+        import re
+        for mod_name in [
+            "core.config", "core.cache", "core.metrics",
+            "core.container", "core.signal_handler",
+        ]:
+            mod = importlib.import_module(mod_name)
+            src = __import__('inspect').getsource(mod)
+            # 查找 threading.Lock() （不包括 RLock）
+            plain_locks = re.findall(r'(?<!R)threading\.Lock\(\)', src)
+            assert plain_locks == [], f"{mod_name} has plain Lock()"
+
+    def test_version_string(self):
+        from version import __version__
+        assert __version__ == "2.0.0"

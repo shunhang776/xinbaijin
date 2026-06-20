@@ -1,0 +1,1106 @@
+"""
+白槿 v2 — 基础设施层。
+
+infra 层提供 LLM 客户端等基础能力，所有对外接口通过子模块暴露。
+"""
+
+from infra.llm_client import LLMClient, llm_client
+
+__all__ = ["LLMClient", "llm_client"]
+"""
+白槿 v2 — LLM 客户端模块。
+
+提供同步/异步双接口、三级降级、熔断器、指数退避重试。
+"""
+
+from infra.llm_client.client import CircuitBreaker, LLMClient, llm_client
+
+__all__ = ["CircuitBreaker", "LLMClient", "llm_client"]
+"""
+白槿 v2 — LLM 客户端：三级降级 + 熔断器 + 指数退避 + Token 统计 + trace_id 传播。
+
+铁律：每函数 ≤ 20 行，先处理异常，零硬编码，锁全用 RLock。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import random
+import threading
+import time
+from typing import Any
+
+import httpx
+
+from core.config import settings
+from core.exceptions import InfraError
+from core.logging import get_logger, trace_id_var
+from core.metrics import metrics
+
+logger = get_logger(__name__)
+
+# ── 常量 ──
+FALLBACK = "嗯…我暂时说不了话。"
+
+DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
+QWEN_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+
+DEFAULT_TIMEOUT = 45.0
+FALLBACK_TIMEOUT = 30.0
+TOOL_TIMEOUT = 30.0
+
+CIRCUIT_THRESHOLD = 3
+CIRCUIT_COOLDOWN = 30.0
+
+RETRY_MAX = 3
+RETRY_BASE = 1.0
+RETRY_MAX_SEC = 60.0
+RETRY_JITTER = 0.1
+
+FALLBACK_MODEL = "qwen-turbo"
+FALLBACK_MAX_TOKENS = 256
+FALLBACK_TEMPERATURE = 0.7
+
+
+def _jittered_delay(attempt: int) -> float:
+    """指数退避: base * 2^attempt，上限 RETRY_MAX_SEC，±10% 抖动。"""
+    raw = RETRY_BASE * (2 ** attempt)
+    bounded = min(raw, RETRY_MAX_SEC)
+    return bounded * (1.0 + random.uniform(-RETRY_JITTER, RETRY_JITTER))
+
+
+class CircuitBreaker:
+    """熔断器：连续失败 ≥ 阈值 → 冷却期内直接拒绝，线程安全（RLock）。"""
+
+    def __init__(self, threshold: int = CIRCUIT_THRESHOLD,
+                 cooldown_sec: float = CIRCUIT_COOLDOWN):
+        self._lock = threading.RLock()
+        self._threshold = threshold
+        self._cooldown = cooldown_sec
+        self._failure_count = 0
+        self._last_failure_time: float = 0.0
+
+    @property
+    def failure_count(self) -> int:
+        with self._lock:
+            return self._failure_count
+
+    @property
+    def last_failure_time(self) -> float:
+        with self._lock:
+            return self._last_failure_time
+
+    def is_open(self) -> bool:
+        """True = 熔断中，直接兜底；冷却期满自动半开。"""
+        with self._lock:
+            if self._failure_count < self._threshold:
+                return False
+            elapsed = time.monotonic() - self._last_failure_time
+            if elapsed >= self._cooldown:
+                self._failure_count = 0
+                self._last_failure_time = 0.0
+                return False
+            return True
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failure_count = 0
+            self._last_failure_time = 0.0
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._failure_count += 1
+            self._last_failure_time = time.monotonic()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._failure_count = 0
+            self._last_failure_time = 0.0
+
+
+class LLMClient:
+    """LLM 客户端：同步/异步双接口，三级降级，指数退避，线程安全。"""
+
+    def __init__(self):
+        self._circuit = CircuitBreaker()
+        self._sync_client: httpx.Client | None = None
+        self._client_lock = threading.RLock()
+
+    # ── 内部：客户端复用 ──
+
+    def _get_client(self) -> httpx.Client:
+        with self._client_lock:
+            if self._sync_client is None or self._sync_client.is_closed:
+                self._sync_client = httpx.Client(
+                    timeout=DEFAULT_TIMEOUT,
+                    limits=httpx.Limits(max_keepalive_connections=4),
+                )
+            return self._sync_client
+
+    # ── 内部：请求头 / 请求体 ──
+
+    @staticmethod
+    def _headers(api_key: str) -> dict[str, str]:
+        h = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        trace_id = trace_id_var.get()
+        if trace_id:
+            h["x-trace-id"] = trace_id
+        return h
+
+    @staticmethod
+    def _body(messages: list[dict], model: str,
+              max_tokens: int, temperature: float,
+              tools: list[dict] | None = None) -> dict:
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if tools:
+            body["tools"] = tools
+        return body
+
+    # ── 内部：Token 统计 ──
+
+    @staticmethod
+    def _record_tokens(resp_json: dict, model: str) -> None:
+        usage = resp_json.get("usage", {})
+        total = usage.get("total_tokens", 0)
+        if total > 0:
+            metrics.record_token(int(total), model=model)
+
+    @staticmethod
+    def _extract_content(resp_json: dict) -> str:
+        content = resp_json["choices"][0]["message"].get("content", "")
+        return content.strip() if content else FALLBACK
+
+    # ── 内部：同步 HTTP 请求 ──
+
+    def _post(self, url: str, api_key: str, body: dict,
+              timeout: float | None = None) -> dict:
+        """同步非流式 POST，返回完整 JSON。异常透传。"""
+        client = self._get_client()
+        kwargs: dict = {"headers": self._headers(api_key), "json": body}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        resp = client.post(url, **kwargs)
+        resp.raise_for_status()
+        return resp.json()
+
+    # ── 内部：异步 HTTP 请求 ──
+
+    async def _post_async(self, url: str, api_key: str, body: dict,
+                          timeout: float | None = None) -> dict:
+        """异步非流式 POST。每次创建新 AsyncClient 避免跨 loop 共享。"""
+        kwargs: dict = {"headers": self._headers(api_key), "json": body}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        async with httpx.AsyncClient(timeout=timeout or DEFAULT_TIMEOUT) as client:
+            resp = await client.post(url, **kwargs)
+            resp.raise_for_status()
+            return resp.json()
+
+    # ── 内部：指数退避封装 ──
+
+    def _retry(self, fn, *args,
+               max_retries: int = RETRY_MAX,
+               base_delay: float = RETRY_BASE,
+               max_delay: float = RETRY_MAX_SEC):
+        """同步指数退避重试。鉴权错误直接抛 InfraError，限流/网络按退避重试。"""
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                return fn(*args)
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                code = e.response.status_code
+                if code in (401, 403):
+                    raise InfraError(f"LLM鉴权失败({code})") from e
+                if code == 429:
+                    logger.warning("API 限流(429)，第 %d 次重试", attempt + 1)
+                else:
+                    logger.warning("HTTP %d，第 %d 次重试", code, attempt + 1)
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                last_error = e
+                logger.warning("网络错误 %s，第 %d 次重试",
+                               type(e).__name__, attempt + 1)
+            except Exception as e:
+                last_error = e
+                logger.warning("%s，第 %d 次重试",
+                               type(e).__name__, attempt + 1)
+            if attempt < max_retries - 1:
+                time.sleep(_jittered_delay(attempt))
+        raise InfraError(f"LLM 请求失败(重试 {max_retries} 次): {last_error}") from last_error
+
+    async def _retry_async(self, fn, *args,
+                           max_retries: int = RETRY_MAX,
+                           base_delay: float = RETRY_BASE,
+                           max_delay: float = RETRY_MAX_SEC):
+        """异步指数退避重试。"""
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                return await fn(*args)
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                code = e.response.status_code
+                if code in (401, 403):
+                    raise InfraError(f"LLM鉴权失败({code})") from e
+                if code == 429:
+                    logger.warning("API 限流(429)，第 %d 次重试", attempt + 1)
+                else:
+                    logger.warning("HTTP %d，第 %d 次重试", code, attempt + 1)
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                last_error = e
+                logger.warning("网络错误 %s，第 %d 次重试",
+                               type(e).__name__, attempt + 1)
+            except Exception as e:
+                last_error = e
+                logger.warning("%s，第 %d 次重试",
+                               type(e).__name__, attempt + 1)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(_jittered_delay(attempt))
+        raise InfraError(f"LLM 请求失败(重试 {max_retries} 次): {last_error}") from last_error
+
+    # ── 三级降级：一级 — 主模型 ──
+
+    def _call_primary(self, messages: list[dict], model: str,
+                      max_tokens: int, temperature: float) -> str:
+        api_key = settings.deepseek_api_key.get_secret_value()
+        body = self._body(messages, model, max_tokens, temperature)
+        resp = self._post(DEEPSEEK_URL, api_key, body, timeout=DEFAULT_TIMEOUT)
+        self._record_tokens(resp, model)
+        return self._extract_content(resp)
+
+    async def _call_primary_async(self, messages: list[dict], model: str,
+                                  max_tokens: int, temperature: float) -> str:
+        api_key = settings.deepseek_api_key.get_secret_value()
+        body = self._body(messages, model, max_tokens, temperature)
+        resp = await self._post_async(DEEPSEEK_URL, api_key, body, timeout=DEFAULT_TIMEOUT)
+        self._record_tokens(resp, model)
+        return self._extract_content(resp)
+
+    # ── 三级降级：二级 — 备用模型 ──
+
+    def _call_fallback(self, messages: list[dict], max_tokens: int) -> str:
+        api_key = settings.qwen_api_key.get_secret_value()
+        capped = min(max_tokens, FALLBACK_MAX_TOKENS)
+        body = self._body(messages, FALLBACK_MODEL, capped, FALLBACK_TEMPERATURE)
+        resp = self._post(QWEN_URL, api_key, body, timeout=FALLBACK_TIMEOUT)
+        self._record_tokens(resp, FALLBACK_MODEL)
+        return self._extract_content(resp)
+
+    async def _call_fallback_async(self, messages: list[dict],
+                                   max_tokens: int) -> str:
+        api_key = settings.qwen_api_key.get_secret_value()
+        capped = min(max_tokens, FALLBACK_MAX_TOKENS)
+        body = self._body(messages, FALLBACK_MODEL, capped, FALLBACK_TEMPERATURE)
+        resp = await self._post_async(QWEN_URL, api_key, body, timeout=FALLBACK_TIMEOUT)
+        self._record_tokens(resp, FALLBACK_MODEL)
+        return self._extract_content(resp)
+
+    # ── 三级降级：三级 — 兜底常量 ──
+
+    @staticmethod
+    def _call_last_resort() -> str:
+        logger.warning("所有模型均不可用，返回兜底常量")
+        return FALLBACK
+
+    # ═══════════════════════════════════════════════════════
+    #  公有接口
+    # ═══════════════════════════════════════════════════════
+
+    def generate(self, messages: list[dict],
+                 model: str = "deepseek-chat",
+                 max_tokens: int = 500,
+                 temperature: float = 0.9) -> str:
+        """同步生成。三级降级：主模型 → 备用模型 → FALLBACK。"""
+        if not messages:
+            return FALLBACK
+        if self._circuit.is_open():
+            logger.warning("熔断器开启，直接返回兜底")
+            return FALLBACK
+
+        # 一级：主模型
+        try:
+            result = self._retry(
+                self._call_primary, messages, model, max_tokens, temperature)
+            self._circuit.record_success()
+            return result
+        except InfraError as e:
+            logger.warning("主模型失败: %s，降级到备用", e.message)
+            self._circuit.record_failure()
+
+        # 二级：备用模型
+        try:
+            result = self._retry(
+                self._call_fallback, messages, max_tokens,
+                max_retries=2, base_delay=0.5, max_delay=10.0)
+            self._circuit.record_success()
+            return result
+        except InfraError as e:
+            logger.error("备用模型也失败: %s，最终兜底", e.message)
+            self._circuit.record_failure()
+
+        return self._call_last_resort()
+
+    async def generate_async(self, messages: list[dict],
+                             model: str = "deepseek-chat",
+                             max_tokens: int = 500,
+                             temperature: float = 0.9) -> str:
+        """异步生成。三级降级：主模型 → 备用模型 → FALLBACK。"""
+        if not messages:
+            return FALLBACK
+        if self._circuit.is_open():
+            logger.warning("熔断器开启，直接返回兜底")
+            return FALLBACK
+
+        try:
+            result = await self._retry_async(
+                self._call_primary_async, messages, model, max_tokens, temperature)
+            self._circuit.record_success()
+            return result
+        except InfraError as e:
+            logger.warning("主模型失败: %s，降级到备用", e.message)
+            self._circuit.record_failure()
+
+        try:
+            result = await self._retry_async(
+                self._call_fallback_async, messages, max_tokens,
+                max_retries=2, base_delay=0.5, max_delay=10.0)
+            self._circuit.record_success()
+            return result
+        except InfraError as e:
+            logger.error("备用模型也失败: %s，最终兜底", e.message)
+            self._circuit.record_failure()
+
+        return self._call_last_resort()
+
+    # ── 工具调用 ──
+
+    def generate_with_tools(self, messages: list[dict],
+                            tools: list[dict],
+                            executor,
+                            model: str = "deepseek-chat",
+                            max_turns: int = 5) -> str:
+        """同步工具调用生成。LLM 最多调用工具 max_turns 轮。
+
+        executor: callable(tool_name: str, arguments: dict) -> str
+        """
+        if not messages or not tools:
+            return self.generate(messages, model=model)
+        if self._circuit.is_open():
+            logger.warning("熔断器开启，直接返回兜底")
+            return FALLBACK
+
+        try:
+            return self._run_tool_loop(
+                messages, tools, executor, model, max_turns)
+        except InfraError as e:
+            logger.warning("工具调用失败: %s，降级到普通生成", e.message)
+            self._circuit.record_failure()
+            return self.generate(messages, model=model)
+
+    def _run_tool_loop(self, messages: list[dict], tools: list[dict],
+                       executor, model: str, max_turns: int) -> str:
+        """工具调用循环：发送 → 解析 tool_calls → 执行 → 追加结果 → 继续。"""
+        msgs = list(messages)
+        api_key = settings.deepseek_api_key.get_secret_value()
+
+        for _ in range(max_turns):
+            body = self._body(msgs, model, 500, 0.9, tools=tools)
+            resp = self._retry(
+                self._post, DEEPSEEK_URL, api_key, body, timeout=TOOL_TIMEOUT,
+                max_retries=2, base_delay=0.5, max_delay=10.0)
+            self._record_tokens(resp, model)
+
+            tcs = self._parse_tool_calls(resp)
+            if not tcs:
+                return self._extract_content(resp)
+
+            msgs.append({
+                "role": "assistant",
+                "tool_calls": tcs,
+                "content": None,
+            })
+            for tc in tcs:
+                fn = tc.get("function", tc)
+                fn_name = fn.get("name", fn.get("function", {}).get("name", ""))
+                try:
+                    fn_args = json.loads(fn.get("arguments", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    fn_args = {}
+                result = executor(fn_name, fn_args)
+                msgs.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", ""),
+                    "content": result,
+                })
+
+        # 超过 max_turns，再做最后一次非工具调用
+        body = self._body(msgs, model, 500, 0.9)
+        resp = self._retry(
+            self._post, DEEPSEEK_URL, api_key, body, timeout=TOOL_TIMEOUT,
+            max_retries=2, base_delay=0.5, max_delay=10.0)
+        self._record_tokens(resp, model)
+        return self._extract_content(resp)
+
+    @staticmethod
+    def _parse_tool_calls(resp: dict) -> list[dict]:
+        """从 API 响应提取工具调用列表。兼容 DeepSeek/Qwen 多种格式。"""
+        msg = resp.get("choices", [{}])[0].get("message", {})
+        if not msg:
+            return []
+        tcs = msg.get("tool_calls", [])
+        if not tcs:
+            return []
+        parsed = []
+        for tc in tcs:
+            fn = tc.get("function", {})
+            parsed.append({
+                "id": tc.get("id", ""),
+                "type": tc.get("type", "function"),
+                "function": {
+                    "name": fn.get("name", ""),
+                    "arguments": fn.get("arguments", "{}"),
+                },
+            })
+        return parsed
+
+
+# ── 模块级单例 ──
+llm_client = LLMClient()
+"""
+infra.database — SQLite connection pool with WAL mode and incremental migrations.
+
+Public API
+----------
+- ``DatabasePool`` — thread-safe connection pool (max 5, RLock), WAL with
+  Windows fallback, auto-transaction on critical writes.
+- ``get_connection`` — context manager that acquires a connection from the
+  pool and automatically returns it on exit (instance method on DatabasePool).
+
+Usage::
+
+    from infra.database import DatabasePool
+
+    pool = DatabasePool()
+
+    # One-shot transactional write
+    pool.execute("INSERT INTO items (id, content) VALUES (?, ?)", ("X", "hello"))
+
+    # Multi-statement DDL
+    pool.executescript("CREATE TABLE IF NOT EXISTS ...")
+
+    # Low-level access (no auto-transaction — caller manages commit)
+    with pool.get_connection() as conn:
+        rows = conn.execute("SELECT * FROM items").fetchall()
+"""
+
+from __future__ import annotations
+
+from infra.database.connection import DatabasePool
+
+__all__ = ["DatabasePool", "get_connection"]
+
+# `get_connection` is an instance method on DatabasePool.
+# Re-export it as a module-level name for discoverability.
+get_connection = DatabasePool.get_connection
+"""
+Database connection pool — SQLite with WAL mode, thread-safe connection management.
+
+Design:
+- Connection pool (max 5) with RLock thread safety.
+- WAL mode enabled by default; falls back to DELETE on incompatible Windows builds.
+- Every critical write is auto-wrapped in BEGIN/COMMIT/ROLLBACK.
+- Context-manager get_connection() acquires from pool, auto-returns on exit.
+- Config sourced from core.config.settings and core.paths.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import sys
+import threading
+from collections import deque
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Generator
+
+from core.config import settings
+from core.logging import get_logger
+from core.paths import DB_PATH
+from core.exceptions import InfraError
+
+logger = get_logger(__name__)
+
+MAX_POOL_SIZE = 5
+
+
+class DatabasePool:
+    """SQLite connection pool.
+
+    - Holds up to ``MAX_POOL_SIZE`` (5) idle connections in a deque.
+    - ``_in_use`` tracks connection ids currently checked out.
+    - All pool mutations are protected by ``threading.RLock``.
+    - If the pool is exhausted an overflow connection is created (not pooled;
+      closed immediately on release).
+    """
+
+    def __init__(self) -> None:
+        # ── resolve db path ──────────────────────────────────────────
+        db_path = getattr(settings, "db_path", DB_PATH)
+        if not db_path or (isinstance(db_path, Path) and str(db_path) == "."):
+            db_path = DB_PATH
+        self._db_path: str = str(db_path)
+        Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
+
+        # ── pragma parameters ────────────────────────────────────────
+        self._cache_mb: int = int(getattr(settings, "db_cache_size_mb", 2000))
+        self._mmap_mb: int = int(getattr(settings, "db_mmap_size_mb", 2048))
+        self._timeout_ms: int = int(getattr(settings, "db_busy_timeout_ms", 5000))
+
+        # ── pool state ───────────────────────────────────────────────
+        self._pool: deque[sqlite3.Connection] = deque()
+        self._in_use: set[int] = set()
+        self._lock: threading.RLock = threading.RLock()
+
+        # ── journal mode ─────────────────────────────────────────────
+        self._wal_mode: str = "delete"  # resolved in _init_wal_mode
+        self._init_wal_mode()
+
+        logger.info(
+            "DatabasePool ready: db=%s wal=%s pool_max=%d cache=%dMB timeout=%dms",
+            self._db_path, self._wal_mode, MAX_POOL_SIZE,
+            self._cache_mb, self._timeout_ms,
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    # WAL mode bootstrap
+    # ══════════════════════════════════════════════════════════════════
+
+    def _init_wal_mode(self) -> None:
+        """Probe WAL mode with a temporary connection.
+
+        On Windows with ancient VFS or network drives, WAL may be
+        unsupported.  When that happens we silently fall back to DELETE
+        and log a warning so the operator is aware.
+        """
+        probe = sqlite3.connect(self._db_path)
+        try:
+            probe.execute("PRAGMA journal_mode = WAL")
+            row = probe.execute("PRAGMA journal_mode").fetchone()
+            mode = row[0].lower() if row else "delete"
+            if mode == "wal":
+                self._wal_mode = "wal"
+                logger.info("WAL mode active: %s", self._db_path)
+            else:
+                self._wal_mode = "delete"
+                logger.warning(
+                    "WAL mode not available (resolved '%s'), "
+                    "falling back to DELETE.", mode,
+                )
+        except sqlite3.OperationalError as exc:
+            self._wal_mode = "delete"
+            logger.warning(
+                "WAL mode unsupported on this platform: %s. "
+                "Falling back to DELETE journal_mode.", exc,
+            )
+        finally:
+            probe.close()
+
+    # ══════════════════════════════════════════════════════════════════
+    # Connection factory
+    # ══════════════════════════════════════════════════════════════════
+
+    def _create_connection(self) -> sqlite3.Connection:
+        """Return a fresh, configured ``sqlite3.Connection``.
+
+        Every connection receives the same PRAGMA profile so callers
+        never need to configure a raw handle themselves.
+        """
+        conn = sqlite3.connect(self._db_path)
+        conn.row_factory = sqlite3.Row
+
+        # journal mode (per-connection; _init_wal_mode already decided
+        # the best mode for this database file)
+        try:
+            conn.execute(f"PRAGMA journal_mode = {self._wal_mode}")
+        except sqlite3.OperationalError:
+            pass
+
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute(f"PRAGMA busy_timeout = {self._timeout_ms}")
+        conn.execute(f"PRAGMA cache_size = -{self._cache_mb * 1000}")
+        conn.execute(f"PRAGMA mmap_size = {self._mmap_mb * 1024 * 1024}")
+        conn.execute("PRAGMA temp_store = MEMORY")
+        conn.execute("PRAGMA wal_autocheckpoint = 1000")
+
+        return conn
+
+    # ══════════════════════════════════════════════════════════════════
+    # Public API
+    # ══════════════════════════════════════════════════════════════════
+
+    @contextmanager
+    def get_connection(self) -> Generator[sqlite3.Connection, None, None]:
+        """Context-managed connection from the pool.
+
+        Usage::
+
+            with pool.get_connection() as conn:
+                rows = conn.execute("SELECT ...").fetchall()
+
+        The connection is automatically health-checked and returned to
+        the pool (or closed if unhealthy / overflow) when the block exits.
+        """
+        conn = self._acquire()
+        try:
+            yield conn
+        finally:
+            self._release(conn)
+
+    def execute(self, sql: str, params: tuple = ()) -> list[dict]:
+        """Execute a single SQL statement inside a transaction.
+
+        ``BEGIN TRANSACTION`` → execute → ``COMMIT``.  On any exception
+        a ``ROLLBACK`` is attempted and the exception is re-raised.
+
+        Returns
+        -------
+        list[dict]
+            Rows returned by the statement.  For writes (INSERT / UPDATE /
+            DELETE) this is typically an empty list; use ``get_connection()``
+            directly if you need ``cursor.rowcount`` or ``cursor.lastrowid``
+            after commit.
+        """
+        with self.get_connection() as conn:
+            try:
+                conn.execute("BEGIN TRANSACTION")
+                cursor = conn.execute(sql, params)
+                rows = [dict(r) for r in cursor.fetchall()]
+                conn.commit()
+                return rows
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+
+    def executemany(self, sql: str, params_list: list[tuple]) -> None:
+        """Execute a single SQL against many parameter sets in one transaction.
+
+        Transactions are atomic: if any row fails the entire batch is rolled back.
+        """
+        with self.get_connection() as conn:
+            try:
+                conn.execute("BEGIN TRANSACTION")
+                conn.executemany(sql, params_list)
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+
+    def executescript(self, sql: str) -> None:
+        """Execute a multi-statement SQL script inside a transaction.
+
+        Useful for DDL (CREATE TABLE, CREATE INDEX, etc.).
+        """
+        with self.get_connection() as conn:
+            try:
+                conn.execute("BEGIN TRANSACTION")
+                conn.executescript(sql)
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+
+    def close(self) -> None:
+        """Close every idle connection in the pool.
+
+        Connections still in-use are *not* force-closed — the caller
+        should ensure no concurrent work is in flight before calling this.
+        """
+        with self._lock:
+            closed = 0
+            while self._pool:
+                conn = self._pool.popleft()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                closed += 1
+            self._pool.clear()
+            self._in_use.clear()
+            logger.info("DatabasePool closed (%d idle connections released).", closed)
+
+    # ══════════════════════════════════════════════════════════════════
+    # Introspection
+    # ══════════════════════════════════════════════════════════════════
+
+    @property
+    def pool_size(self) -> int:
+        """Number of connections currently sitting idle in the pool."""
+        with self._lock:
+            return len(self._pool)
+
+    @property
+    def in_use_count(self) -> int:
+        """Number of connections currently checked out."""
+        with self._lock:
+            return len(self._in_use)
+
+    @property
+    def wal_mode(self) -> str:
+        """Resolved journal mode: ``"wal"`` or ``"delete"``."""
+        return self._wal_mode
+
+    @property
+    def db_path(self) -> str:
+        """Absolute path to the database file."""
+        return self._db_path
+
+    # ══════════════════════════════════════════════════════════════════
+    # Internal
+    # ══════════════════════════════════════════════════════════════════
+
+    def _acquire(self) -> sqlite3.Connection:
+        """Take a connection from the pool (or create one).
+
+        Called inside ``get_connection()`` — not part of the public API.
+        """
+        with self._lock:
+            # Recycle an idle connection that is *not* still in_use
+            while self._pool:
+                conn = self._pool.popleft()
+                conn_id = id(conn)
+                if conn_id not in self._in_use:
+                    self._in_use.add(conn_id)
+                    return conn
+                # Stale entry in deque — discard
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+            # Pool has capacity — create a fresh connection
+            if len(self._in_use) < MAX_POOL_SIZE:
+                conn = self._create_connection()
+                self._in_use.add(id(conn))
+                return conn
+
+        # Pool exhausted — overflow connection (not tracked/pooled)
+        logger.warning(
+            "Connection pool exhausted (%d/%d in use), "
+            "creating overflow connection.",
+            len(self._in_use), MAX_POOL_SIZE,
+        )
+        return self._create_connection()
+
+    def _release(self, conn: sqlite3.Connection) -> None:
+        """Return *conn* to the pool or close it.
+
+        Overflow connections (not in ``_in_use``) and unhealthy
+        connections are closed instead of being returned to the pool.
+        """
+        conn_id = id(conn)
+        with self._lock:
+            if conn_id not in self._in_use:
+                # Overflow connection — just close it
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return
+
+            self._in_use.discard(conn_id)
+
+            # Health check before recycling
+            try:
+                conn.execute("SELECT 1")
+            except sqlite3.Error:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return
+
+            if len(self._pool) < MAX_POOL_SIZE:
+                self._pool.append(conn)
+                return
+
+        # Pool full or health check failed — close
+        try:
+            conn.close()
+        except Exception:
+            pass
+"""
+Database migration framework — versioned, ordered, idempotent.
+
+How it works:
+- Every migration is a ``(version, description, sql)`` tuple in the
+  ``MIGRATIONS`` list.
+- ``run_migrations(pool)`` creates the ``_migrations`` tracking table
+  (if needed), queries already-applied versions, and runs any pending
+  migrations in ascending version order.
+- Each migration and its tracking insert execute inside a single
+  transaction — applied or skipped atomically.
+"""
+
+from __future__ import annotations
+
+from core.logging import get_logger
+
+logger = get_logger(__name__)
+
+# ══════════════════════════════════════════════════════════════════════
+# Migration registry
+# ══════════════════════════════════════════════════════════════════════
+
+MIGRATIONS: list[tuple[int, str, str]] = [
+    # (version, description, sql_statement)
+    # Add new migrations at the end in ascending version order.
+    # Example:
+    # (1, "create items table", "CREATE TABLE IF NOT EXISTS items (...);"),
+]
+
+# ══════════════════════════════════════════════════════════════════════
+# Runner
+# ══════════════════════════════════════════════════════════════════════
+
+
+def run_migrations(pool) -> None:
+    """Execute all pending migrations against *pool* in version order.
+
+    Parameters
+    ----------
+    pool : DatabasePool
+        The connection pool to run migrations against (imported from
+        ``infra.database.connection``).
+    """
+    # ── ensure tracking table exists ─────────────────────────────────
+    with pool.get_connection() as conn:
+        conn.execute("BEGIN TRANSACTION")
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS _migrations (
+                    version     INTEGER PRIMARY KEY,
+                    description TEXT    NOT NULL,
+                    executed_at TEXT    NOT NULL
+                )
+            """)
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+
+    # ── determine already-applied versions ───────────────────────────
+    with pool.get_connection() as conn:
+        try:
+            rows = conn.execute("SELECT version FROM _migrations ORDER BY version").fetchall()
+            applied: set[int] = {r["version"] for r in rows}
+        except Exception:
+            applied = set()
+
+    # ── sort and filter ──────────────────────────────────────────────
+    pending = [m for m in MIGRATIONS if m[0] not in applied]
+    pending.sort(key=lambda m: m[0])
+
+    if not pending:
+        logger.debug("No pending migrations (applied: %d).", len(applied))
+        return
+
+    logger.info(
+        "Pending migrations: %d (applied: %d, total registered: %d).",
+        len(pending), len(applied), len(MIGRATIONS),
+    )
+
+    # ── execute each pending migration in its own transaction ────────
+    from datetime import datetime, timezone
+
+    for version, description, sql in pending:
+        logger.info("Applying migration %d — %s ...", version, description)
+
+        with pool.get_connection() as conn:
+            try:
+                conn.execute("BEGIN TRANSACTION")
+                conn.execute(sql)
+                conn.execute(
+                    "INSERT INTO _migrations (version, description, executed_at) "
+                    "VALUES (?, ?, ?)",
+                    (version, description, datetime.now(timezone.utc).isoformat()),
+                )
+                conn.commit()
+                logger.info("Migration %d applied successfully.", version)
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                logger.exception(
+                    "Migration %d (%s) FAILED — aborting migration run.", version, description
+                )
+                raise
+
+    logger.info("All %d pending migration(s) applied.", len(pending))
+"""
+infra/embedding — BGE-M3 嵌入模块。
+
+提供线程安全的 BGEEmbedder 单例，Query/Doc 分锁互不阻塞。
+"""
+from .embedder import BGEEmbedder, get_embedder
+
+__all__ = ["BGEEmbedder", "get_embedder"]
+"""
+BGE-M3 嵌入模型加载器。检索/写入独立锁，线程安全单例。
+"""
+import threading
+
+import numpy as np
+
+from core.config import settings
+from core.exceptions import InfraError
+from core.logging import get_logger
+
+from .config import MODEL_PATH, QUERY_INSTRUCTION, USE_FP16, VECTOR_DIM
+
+_logger = get_logger(__name__)
+
+_embedder: "BGEEmbedder | None" = None
+_lock = threading.RLock()
+
+
+class BGEEmbedder:
+    """BGE-M3 封装。Query/Doc 分锁，检索写入互不阻塞。"""
+
+    def __init__(self):
+        try:
+            from FlagEmbedding import FlagModel
+        except ImportError as e:
+            raise InfraError(
+                f"FlagEmbedding 未安装，无法加载 BGE-M3 模型: {e}",
+                error_code="INF_EMBED_IMPORT",
+            ) from e
+
+        _logger.info("加载嵌入模型: %s (dim=%d)", MODEL_PATH, VECTOR_DIM)
+
+        try:
+            self.model = FlagModel(
+                MODEL_PATH,
+                query_instruction_for_retrieval=QUERY_INSTRUCTION,
+                use_fp16=USE_FP16,
+            )
+        except Exception as e:
+            raise InfraError(
+                f"加载 BGE-M3 模型失败: {e}",
+                error_code="INF_EMBED_LOAD",
+            ) from e
+
+        self._query_lock = threading.RLock()
+        self._doc_lock = threading.RLock()
+        self.model_name = settings.embedding_model_name
+        self.vector_dim = VECTOR_DIM
+
+    def encode_query(self, queries: list[str]) -> np.ndarray:
+        """编码查询向量。使用查询锁，与文档编码互不阻塞。"""
+        if not queries:
+            raise InfraError("查询列表为空", error_code="INF_EMBED_EMPTY_QUERY")
+        with self._query_lock:
+            vec = self.model.encode_queries(queries)
+            return np.ascontiguousarray(vec)
+
+    def encode_doc(self, docs: list[str]) -> np.ndarray:
+        """编码文档向量。使用文档锁，与查询编码互不阻塞。"""
+        if not docs:
+            raise InfraError("文档列表为空", error_code="INF_EMBED_EMPTY_DOC")
+        with self._doc_lock:
+            vec = self.model.encode(docs)
+            return np.ascontiguousarray(vec)
+
+
+def get_embedder() -> BGEEmbedder:
+    """获取 BGEEmbedder 单例。双重检查锁 + RLock。首次加载时预热。"""
+    global _embedder
+    if _embedder is None:
+        with _lock:
+            if _embedder is None:
+                _embedder = BGEEmbedder()
+                _warmup(_embedder)
+    return _embedder
+
+
+def _warmup(embedder: BGEEmbedder) -> None:
+    """首次加载后预热：跑一次 dummy query 触发 JIT/模型初始化。"""
+    try:
+        _logger.info("嵌入模型预热中...")
+        _ = embedder.encode_query(["预热"])
+        _logger.info("嵌入模型预热完成")
+    except Exception as e:
+        _logger.warning("嵌入模型预热失败（不影响正常使用）: %s", e)
+"""
+嵌入模型配置。从 core.config.settings 读取，跨平台模型路径处理。
+"""
+import os
+from pathlib import Path
+
+from core.config import settings
+
+# ── 从统一配置中心读取 ──
+EMBEDDING_MODEL_NAME: str = settings.embedding_model_name
+QUERY_INSTRUCTION: str = settings.query_instruction
+VECTOR_DIM: int = settings.vector_dim
+USE_FP16: bool = False  # CPU 环境必须关闭，PyTorch CPU 对 fp16 支持残缺
+
+
+def resolve_model_path() -> str:
+    """跨平台解析模型路径。
+
+    优先级：环境变量 BGE_MODEL_PATH > HF_HOME 缓存自动检测 > 用户默认缓存 > 回退路径。
+    支持 HuggingFace 新旧两种缓存目录格式。
+    """
+    # 1. 环境变量优先
+    env_path = os.getenv("BGE_MODEL_PATH", "")
+    if env_path and Path(env_path).exists():
+        return env_path
+
+    model_name = EMBEDDING_MODEL_NAME  # e.g. "BAAI/bge-m3"
+    org, name = (model_name.split("/", 1) + [""])[:2]
+
+    # 2. 自动检测 HuggingFace 缓存
+    hf_home = os.getenv("HF_HOME", str(Path.home() / ".cache" / "huggingface"))
+
+    # 新格式：~/.cache/huggingface/hub/models--{org}--{name}/snapshots/<hash>
+    snapshots_dir = Path(hf_home) / "hub" / f"models--{org}--{name}" / "snapshots"
+    if snapshots_dir.is_dir():
+        snapshots = sorted(
+            [d for d in snapshots_dir.iterdir() if d.is_dir()],
+            reverse=True,
+        )
+        if snapshots:
+            return str(snapshots[0])
+
+    # 旧格式：~/.cache/huggingface/hub/{org}/{name}
+    legacy_dir = Path(hf_home) / "hub" / model_name
+    if legacy_dir.exists():
+        return str(legacy_dir)
+
+    # 3. 默认回退路径（向后兼容）
+    return str(Path.home() / ".cache" / "huggingface" / "hub" / model_name)
+
+
+MODEL_PATH: str = resolve_model_path()

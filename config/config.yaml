@@ -1,0 +1,39 @@
+# 白槿 v2 配置文件
+# 只改冒号后面的值，不要改参数名和缩进
+
+# 记忆引擎数据库（由 memory_engine/config.py 管理）
+# DB_PATH = data/memory.db
+# FAISS_INDEX_PATH = data/faiss.index
+
+# 记忆衰减
+memory:
+  s_grade_lock: true  # S 级（人格核心）锁定不衰减
+  a_grade_decay: 0.99
+  b_grade_decay: 0.95
+  c_grade_decay: 0.90
+  max_core_memories: 2000
+
+# DeepSeek API
+deepseek:
+  api_key_env: "DEEPSEEK_API_KEY"  # 从环境变量读取
+  model: "deepseek-chat"
+  timeout: 30  # 秒
+  max_retries: 3
+  max_tokens: 500
+
+# 服务
+server:
+  host: "127.0.0.1"
+  port: 8080
+
+# 运维
+ops:
+  check_interval: 30    # 巡检间隔（秒）
+  backup_interval: 10800  # 备份间隔（秒，3小时）
+  backup_keep: 7        # 保留备份数量
+  remote_backup: "D:/beifen"  # 异地备份路径，设空字符串禁用
+
+# 睡眠作息
+sleep:
+  sleep_hour: 23
+  wake_hour: 7

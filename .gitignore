@@ -1,0 +1,35 @@
+# === 敏感信息 ===
+.env
+.mcp.json
+
+# === 运行时数据 ===
+data/
+*.pkl
+*.db
+*.db-shm
+*.db-wal
+*.index
+*.index.bak
+*.faiss
+
+# === 运行时产物 ===
+logs/
+*.log
+__pycache__/
+*.pyc
+.pytest_cache/
+.locks/
+*.out
+
+# === 历史备份 ===
+backup/
+
+# === IDE / 工具会话 ===
+.claude/
+.idea/
+.vscode/
+
+# === 临时文件与其他仓库产物 ===
+tmp_*.txt
+tmp_*.json
+xinbaijin-mcp.zip

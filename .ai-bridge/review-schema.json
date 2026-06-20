@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "代码审查报告",
+  "description": "ChatGPT 审查后写入 review.json，Claude Code 读取后逐条修复",
+  "type": "object",
+  "required": ["meta", "summary", "findings"],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": ["reviewed_at", "reviewer"],
+      "properties": {
+        "reviewed_at": { "type": "string", "format": "date-time" },
+        "reviewer": { "type": "string" },
+        "commit_range": { "type": "string", "description": "git diff --stat 的输出" },
+        "files_reviewed": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["verdict", "severity"],
+      "properties": {
+        "verdict": { "enum": ["approved", "needs_changes", "rejected"] },
+        "severity": { "enum": ["low", "medium", "high", "critical"] },
+        "key_issues": { "type": "integer" },
+        "key_praises": { "type": "integer" }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "file", "severity", "category", "title", "description"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[RS]\\d{3}$" },
+          "file": { "type": "string" },
+          "line": { "type": "integer" },
+          "severity": { "enum": ["low", "medium", "high", "critical"] },
+          "category": { "enum": ["security", "bug", "performance", "style", "architecture", "maintainability"] },
+          "title": { "type": "string" },
+          "description": { "type": "string" },
+          "suggestion": { "type": "string" },
+          "code_snippet": { "type": "string" }
+        }
+      }
+    },
+    "structural_issues": {
+      "type": "array",
+      "description": "第一层：架构/设计问题",
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "description"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^S\\d{3}$" },
+          "title": { "type": "string" },
+          "description": { "type": "string" },
+          "files_affected": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "positive_findings": {
+      "type": "array",
+      "description": "做得好的地方，给予正向反馈",
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "description"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^P\\d{3}$" },
+          "title": { "type": "string" },
+          "description": { "type": "string" }
+        }
+      }
+    }
+  }
+}

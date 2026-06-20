@@ -1,0 +1,5 @@
+# baijin v2 dependencies
+# production:  pip install -r requirements/base.txt
+# all-in-one:  pip install -r requirements/all.txt
+# minimal:     pip install -r requirements/core.txt
+-r requirements/base.txt

@@ -1,0 +1,7 @@
+# baijin v2 optional deps (gracefully degraded if missing)
+# wmi        - Windows CPU temperature (senses.py)
+# jionlp     - Chinese time NER (index_time.py)
+# datasketch - MinHash dedup (evolve.py)
+wmi
+jionlp
+datasketch

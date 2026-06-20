@@ -1,0 +1,3 @@
+# baijin v2 production deploy
+-r server.txt
+-r memory.txt

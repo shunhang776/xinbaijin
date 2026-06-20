@@ -1,0 +1,66 @@
+"""
+全项目时间戳统一为北京时间秒级戳，格式化统一入口。
+
+铁律：
+  1. 所有内部时间统一使用 now_ts() 生成的北京时间戳，禁止直接调用 time.time()
+  2. 外部数据进入：utc_ts_to_bj() 转换后再进业务
+  3. 数据发往外部：bj_ts_to_utc() 转换后再发出
+  4. 格式化统一走 fmt_ts() / day_str() / week_str()，不直接用 datetime.fromtimestamp()
+"""
+
+from __future__ import annotations
+
+import time as _time
+from datetime import datetime, timezone, timedelta
+
+__all__ = [
+    "now_ts", "ts_to_datetime", "validate_ts",
+    "fmt_ts", "day_str", "week_str",
+    "utc_ts_to_bj", "bj_ts_to_utc",
+]
+
+_BEIJING_OFFSET: int = 8 * 3600
+_BEIJING = timezone(timedelta(hours=8))
+
+
+def utc_ts_to_bj(utc_ts: float | int) -> int:
+    """标准 UTC Unix 时间戳 → 北京时间戳。外部数据进入系统的唯一入口。"""
+    return int(utc_ts + _BEIJING_OFFSET)
+
+
+def bj_ts_to_utc(bj_ts: float | int) -> int:
+    """北京时间戳 → 标准 UTC Unix 时间戳。数据发往外部的唯一出口。"""
+    return int(bj_ts - _BEIJING_OFFSET)
+
+
+def now_ts() -> int:
+    """北京时间秒级戳。全项目唯一合法的时间戳生成入口。"""
+    return int(_time.time() + _BEIJING_OFFSET)
+
+
+def ts_to_datetime(ts: int) -> datetime:
+    """北京秒级戳 → datetime（北京时区）。全项目唯一合法的格式化入口。"""
+    return datetime.fromtimestamp(ts - _BEIJING_OFFSET, _BEIJING)
+
+
+def validate_ts(ts: int) -> int:
+    """校验外部传入的时间戳：必须是秒级，毫秒级直接报错。"""
+    if ts >= 10 ** 12:
+        raise ValueError(f"禁止毫秒时间戳: {ts}，请传秒级北京时间戳")
+    return ts
+
+
+def fmt_ts(ts: int) -> str:
+    """北京时间戳 → ISO 格式字符串（仅用于日志展示）。"""
+    return ts_to_datetime(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def day_str(ts: int) -> str:
+    """北京时间戳 → 'YYYY-MM-DD'（用于按天分组）。"""
+    return ts_to_datetime(ts).strftime("%Y-%m-%d")
+
+
+def week_str(ts: int) -> str:
+    """北京时间戳 → 'YYYY-W##'（用于按周分组）。"""
+    dt = ts_to_datetime(ts)
+    return f"{dt.year}-W{dt.isocalendar()[1]:02d}"

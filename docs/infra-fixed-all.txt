@@ -1,0 +1,2269 @@
+=== infra/database/__init__.py ===
+"""
+infra.database — SQLite connection pool with WAL mode and incremental migrations.
+
+Public API
+----------
+- ``DatabasePool`` — thread-safe connection pool (max 5, RLock), WAL with
+  Windows fallback, auto-transaction on critical writes.
+- ``get_connection`` — context manager that acquires a connection from the
+  pool and automatically returns it on exit (instance method on DatabasePool).
+
+Usage::
+
+    from infra.database import DatabasePool
+
+    pool = DatabasePool()
+
+    # One-shot transactional write
+    pool.execute("INSERT INTO items (id, content) VALUES (?, ?)", ("X", "hello"))
+
+    # Multi-statement DDL
+    pool.executescript("CREATE TABLE IF NOT EXISTS ...")
+
+    # Low-level access (no auto-transaction — caller manages commit)
+    with pool.get_connection() as conn:
+        rows = conn.execute("SELECT * FROM items").fetchall()
+"""
+
+from __future__ import annotations
+
+from infra.database.connection import DatabasePool
+
+__all__ = ["DatabasePool", "db_pool", "get_connection"]
+
+# Module-level singleton pool so that ``get_connection`` is a bound method.
+#
+# IMPORTANT: db_pool 在首次导入时初始化，需确保 core.config 已加载（在 infra 导入之前导入 core）。
+# 这是启动顺序约定，不在此处做代码层面延迟初始化。
+db_pool = DatabasePool()
+
+# ``get_connection`` is a bound instance method on ``db_pool``, callable as
+# ``get_connection()`` without an explicit ``self`` argument.
+get_connection = db_pool.get_connection
+
+=== infra/database/migrations.py ===
+"""
+Database migration framework — versioned, ordered, idempotent.
+
+How it works:
+- Every migration is a ``(version, description, sql)`` tuple in the
+  ``MIGRATIONS`` list.
+- ``run_migrations(pool)`` creates the ``_migrations`` tracking table
+  (if needed), queries already-applied versions, and runs any pending
+  migrations in ascending version order.
+- Each migration and its tracking insert execute inside a single
+  transaction — applied or skipped atomically.
+"""
+
+from __future__ import annotations
+
+from core.logging import get_logger
+from core.utils import fmt_ts, now_ts
+
+logger = get_logger(__name__)
+
+__all__ = ["MIGRATIONS", "run_migrations"]
+
+# ══════════════════════════════════════════════════════════════════════
+# Migration registry
+# ══════════════════════════════════════════════════════════════════════
+
+MIGRATIONS: list[tuple[int, str, str]] = [
+    # (version, description, sql_statement)
+    # Add new migrations at the end in ascending version order.
+    # Example:
+    # (1, "create items table", "CREATE TABLE IF NOT EXISTS items (...);"),
+]
+
+# ══════════════════════════════════════════════════════════════════════
+# Runner
+# ══════════════════════════════════════════════════════════════════════
+
+
+def run_migrations(pool: "DatabasePool") -> None:
+    """Execute all pending migrations against *pool* in version order.
+
+    Parameters
+    ----------
+    pool : DatabasePool
+        The connection pool to run migrations against (imported from
+        ``infra.database.connection``).
+    """
+    # ── ensure tracking table exists ─────────────────────────────────
+    with pool.get_connection() as conn:
+        conn.execute("BEGIN TRANSACTION")
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS _migrations (
+                    version     INTEGER PRIMARY KEY,
+                    description TEXT    NOT NULL,
+                    executed_at TEXT    NOT NULL
+                )
+            """)
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+
+    # ── determine already-applied versions ───────────────────────────
+    with pool.get_connection() as conn:
+        try:
+            rows = conn.execute("SELECT version FROM _migrations ORDER BY version").fetchall()
+            applied: set[int] = {r["version"] for r in rows}
+        except Exception:
+            applied = set()
+
+    # ── sort and filter ──────────────────────────────────────────────
+    pending = [m for m in MIGRATIONS if m[0] not in applied]
+    pending.sort(key=lambda m: m[0])
+
+    if not pending:
+        logger.debug("No pending migrations (applied: %d).", len(applied))
+        return
+
+    logger.info(
+        "Pending migrations: %d (applied: %d, total registered: %d).",
+        len(pending), len(applied), len(MIGRATIONS),
+    )
+
+    # ── execute each pending migration in its own transaction ────────
+    for version, description, sql in pending:
+        logger.info("Applying migration %d — %s ...", version, description)
+
+        with pool.get_connection() as conn:
+            try:
+                conn.execute("BEGIN TRANSACTION")
+                conn.execute(sql)
+                conn.execute(
+                    "INSERT INTO _migrations (version, description, executed_at) "
+                    "VALUES (?, ?, ?)",
+                    (version, description, fmt_ts(now_ts())),
+                )
+                conn.commit()
+                logger.info("Migration %d applied successfully.", version)
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                logger.exception(
+                    "Migration %d (%s) FAILED — aborting migration run.", version, description
+                )
+                raise
+
+    logger.info("All %d pending migration(s) applied.", len(pending))
+
+=== infra/llm_client/client.py ===
+"""
+白槿 v2 — LLM 客户端：三级降级 + 熔断器 + 指数退避 + Token 统计 + trace_id 传播。
+
+铁律：每函数 ≤ 20 行，先处理异常，零硬编码，锁全用 RLock。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import random
+import threading
+import time
+from typing import Any, Callable
+
+import httpx
+
+from core.config import settings
+from core.constants import APIPath
+from core.exceptions import InfraError
+from core.logging import get_logger, trace_id_var
+from core.metrics import metrics
+
+logger = get_logger(__name__)
+
+# ── 硬编码兜底常量（运行时优先读 core.config.settings）──
+FALLBACK = "嗯…我暂时说不了话。"
+
+# 超时 / 熔断 / 重试 兜底值（模组级常量，__init__ 中优先从 settings 读取）
+DEFAULT_TIMEOUT = 45.0
+FALLBACK_TIMEOUT = 30.0
+TOOL_TIMEOUT = 30.0  # 兜底默认值，运行时优先从 settings.llm_tool_timeout 读取
+
+CIRCUIT_THRESHOLD = 3
+CIRCUIT_COOLDOWN = 30.0
+
+RETRY_MAX = 3
+RETRY_BASE = 1.0
+RETRY_MAX_SEC = 60.0
+RETRY_JITTER = 0.1
+
+# 备用模型 兜底值（__init__ 中优先从 settings 读取）
+FALLBACK_MODEL = "qwen-turbo"
+FALLBACK_MAX_TOKENS = 256
+FALLBACK_TEMPERATURE = 0.7
+
+
+def _jittered_delay(attempt: int, base: float = RETRY_BASE,
+                    max_delay: float = RETRY_MAX_SEC) -> float:
+    """指数退避: base * 2^attempt，上限 max_delay，±10% 抖动。（P1-4: 接受自定义参数）"""
+    raw = base * (2 ** attempt)
+    bounded = min(raw, max_delay)
+    return bounded * (1.0 + random.uniform(-RETRY_JITTER, RETRY_JITTER))
+
+
+class CircuitBreaker:
+    """熔断器：连续失败 ≥ 阈值 → 冷却期内直接拒绝，线程安全（RLock）。"""
+
+    def __init__(self, threshold: int = CIRCUIT_THRESHOLD,
+                 cooldown_sec: float = CIRCUIT_COOLDOWN):
+        self._lock = threading.RLock()
+        self._threshold = threshold
+        self._cooldown = cooldown_sec
+        self._failure_count = 0
+        self._last_failure_time: float = 0.0
+
+    @property
+    def failure_count(self) -> int:
+        with self._lock:
+            return self._failure_count
+
+    @property
+    def last_failure_time(self) -> float:
+        with self._lock:
+            return self._last_failure_time
+
+    def is_open(self, threshold: int | None = None,
+                cooldown_sec: float | None = None) -> bool:
+        """True = 熔断中；冷却期满自动半开。支持运行时覆盖阈值/冷却（热更）。"""
+        thresh = threshold if threshold is not None else self._threshold
+        cool = cooldown_sec if cooldown_sec is not None else self._cooldown
+        with self._lock:
+            if self._failure_count < thresh:
+                return False
+            elapsed = time.monotonic() - self._last_failure_time
+            if elapsed >= cool:
+                self._failure_count = 0
+                self._last_failure_time = 0.0
+                return False
+            return True
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failure_count = 0
+            self._last_failure_time = 0.0
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._failure_count += 1
+            self._last_failure_time = time.monotonic()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._failure_count = 0
+            self._last_failure_time = 0.0
+
+
+class LLMClient:
+    """LLM 客户端：同步/异步双接口，三级降级，指数退避，线程安全。"""
+
+    def __init__(self):
+        # ISSUE 5: 备用模型参数优先从 settings 读取，回退到模块常量
+        self.fallback_model = getattr(settings, 'llm_fallback_model', FALLBACK_MODEL)
+        self.fallback_max_tokens = int(
+            getattr(settings, 'llm_fallback_max_tokens', FALLBACK_MAX_TOKENS))
+        self.fallback_temperature = float(
+            getattr(settings, 'llm_fallback_temperature', FALLBACK_TEMPERATURE))
+
+        self._circuit = CircuitBreaker(
+            threshold=self.circuit_threshold,
+            cooldown_sec=self.circuit_cooldown)
+        self._sync_client: httpx.Client | None = None
+        self._client_lock = threading.RLock()
+
+    # ── ISSUE 2: 属性实时从 settings 读取，支持热重载无需重启 ──
+
+    @property
+    def default_timeout(self) -> float:
+        return float(getattr(settings, 'llm_default_timeout', DEFAULT_TIMEOUT))
+
+    @property
+    def fallback_timeout(self) -> float:
+        return float(getattr(settings, 'llm_fallback_timeout', FALLBACK_TIMEOUT))
+
+    @property
+    def tool_timeout(self) -> float:
+        return float(getattr(settings, 'llm_tool_timeout', TOOL_TIMEOUT))
+
+    @property
+    def circuit_threshold(self) -> int:
+        return int(getattr(settings, 'llm_circuit_threshold', CIRCUIT_THRESHOLD))
+
+    @property
+    def circuit_cooldown(self) -> float:
+        return float(getattr(settings, 'llm_circuit_cooldown', CIRCUIT_COOLDOWN))
+
+    @property
+    def retry_max(self) -> int:
+        return int(getattr(settings, 'llm_retry_max', RETRY_MAX))
+
+    @property
+    def retry_base(self) -> float:
+        return float(getattr(settings, 'llm_retry_base', RETRY_BASE))
+
+    @property
+    def retry_max_sec(self) -> float:
+        return float(getattr(settings, 'llm_retry_max_sec', RETRY_MAX_SEC))
+
+    # ── 内部：客户端复用 ──
+
+    def _get_client(self) -> httpx.Client:
+        with self._client_lock:
+            if self._sync_client is None or self._sync_client.is_closed:
+                self._sync_client = httpx.Client(
+                    timeout=self.default_timeout,
+                    limits=httpx.Limits(max_keepalive_connections=4),
+                )
+            return self._sync_client
+
+    # ── 内部：请求头 / 请求体 ──
+
+    @staticmethod
+    def _headers(api_key: str) -> dict[str, str]:
+        h = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        trace_id = trace_id_var.get()
+        if trace_id:
+            h["x-trace-id"] = trace_id
+        return h
+
+    @staticmethod
+    def _body(messages: list[dict], model: str,
+              max_tokens: int, temperature: float,
+              tools: list[dict] | None = None) -> dict:
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if tools:
+            body["tools"] = tools
+        return body
+
+    # ── 内部：Token 统计 ──
+
+    @staticmethod
+    def _record_tokens(resp_json: dict, model: str) -> None:
+        usage = resp_json.get("usage", {})
+        total = usage.get("total_tokens", 0)
+        if total > 0:
+            metrics.record_token(int(total), model=model)
+
+    @staticmethod
+    def _extract_content(resp_json: dict) -> str:
+        content = resp_json["choices"][0]["message"].get("content", "")
+        return content.strip() if content else FALLBACK
+
+    # ── 内部：同步 HTTP 请求 ──
+
+    def _post(self, url: str, api_key: str, body: dict,
+              timeout: float | None = None) -> dict:
+        """同步非流式 POST，返回完整 JSON。异常透传。"""
+        client = self._get_client()
+        kwargs: dict = {"headers": self._headers(api_key), "json": body}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        resp = client.post(url, **kwargs)
+        resp.raise_for_status()
+        return resp.json()
+
+    # ── 内部：异步 HTTP 请求 ──
+
+    async def _post_async(self, url: str, api_key: str, body: dict,
+                          timeout: float | None = None) -> dict:
+        """异步非流式 POST。每次创建新 AsyncClient 避免跨 loop 共享。"""
+        kwargs: dict = {"headers": self._headers(api_key), "json": body}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        async with httpx.AsyncClient(timeout=timeout or self.default_timeout) as client:
+            resp = await client.post(url, **kwargs)
+            resp.raise_for_status()
+            return resp.json()
+
+    # ── 内部：指数退避封装 ──
+
+    def _retry(self, fn, *args,
+               max_retries: int | None = None,
+               base_delay: float | None = None,
+               max_delay: float | None = None,
+               **kwargs):
+        """同步指数退避重试。鉴权错误直接抛 InfraError，限流/网络按退避重试。
+
+        P0-2: 接受 **kwargs 并转发给 fn（如上层的 timeout=TOOL_TIMEOUT）。
+        P2-6: 默认重试参数优先来自实例属性（settings），兜底模块常量。
+
+        ISSUE 4: 仅重试网络/HTTP 层异常，不捕获 TypeError/ValueError/KeyError/
+        AttributeError/NameError 等编程错误，避免凭退避掩盖代码 bug。
+        """
+        max_retries = max_retries if max_retries is not None else self.retry_max
+        base_delay = base_delay if base_delay is not None else self.retry_base
+        max_delay = max_delay if max_delay is not None else self.retry_max_sec
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                return fn(*args, **kwargs)
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                code = e.response.status_code
+                if code in (401, 403):
+                    raise InfraError(f"LLM鉴权失败({code})") from e
+                if code == 429:
+                    logger.warning("API 限流(429)，第 %d 次重试", attempt + 1)
+                else:
+                    logger.warning("HTTP %d，第 %d 次重试", code, attempt + 1)
+            except (httpx.TimeoutException, httpx.ConnectError,
+                    httpx.NetworkError, OSError) as e:
+                last_error = e
+                logger.warning("网络错误 %s，第 %d 次重试",
+                               type(e).__name__, attempt + 1)
+            if attempt < max_retries - 1:
+                # P1-4: 传递自定义 base / max_delay
+                time.sleep(_jittered_delay(attempt, base_delay, max_delay))
+        raise InfraError(f"LLM 请求失败(重试 {max_retries} 次): {last_error}") from last_error
+
+    async def _retry_async(self, fn, *args,
+                           max_retries: int | None = None,
+                           base_delay: float | None = None,
+                           max_delay: float | None = None,
+                           **kwargs):
+        """异步指数退避重试。
+
+        P0-2: 接受 **kwargs 并转发给 fn。
+        P2-6: 默认重试参数优先来自实例属性（settings），兜底模块常量。
+
+        ISSUE 4: 仅重试网络/HTTP 层异常，不捕获编程错误（TypeError/ValueError/
+        KeyError/AttributeError/NameError），避免凭退避掩盖代码 bug。
+        """
+        max_retries = max_retries if max_retries is not None else self.retry_max
+        base_delay = base_delay if base_delay is not None else self.retry_base
+        max_delay = max_delay if max_delay is not None else self.retry_max_sec
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                return await fn(*args, **kwargs)
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                code = e.response.status_code
+                if code in (401, 403):
+                    raise InfraError(f"LLM鉴权失败({code})") from e
+                if code == 429:
+                    logger.warning("API 限流(429)，第 %d 次重试", attempt + 1)
+                else:
+                    logger.warning("HTTP %d，第 %d 次重试", code, attempt + 1)
+            except (httpx.TimeoutException, httpx.ConnectError,
+                    httpx.NetworkError, OSError) as e:
+                last_error = e
+                logger.warning("网络错误 %s，第 %d 次重试",
+                               type(e).__name__, attempt + 1)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(_jittered_delay(attempt, base_delay, max_delay))
+        raise InfraError(f"LLM 请求失败(重试 {max_retries} 次): {last_error}") from last_error
+
+    # ── 三级降级：一级 — 主模型 ──
+
+    def _call_primary(self, messages: list[dict], model: str,
+                      max_tokens: int, temperature: float) -> str:
+        api_key = settings.deepseek_api_key.get_secret_value()
+        body = self._body(messages, model, max_tokens, temperature)
+        resp = self._post(APIPath.LLM_DEEPSEEK_CHAT.value, api_key, body,
+                          timeout=self.default_timeout)
+        self._record_tokens(resp, model)
+        return self._extract_content(resp)
+
+    async def _call_primary_async(self, messages: list[dict], model: str,
+                                  max_tokens: int, temperature: float) -> str:
+        api_key = settings.deepseek_api_key.get_secret_value()
+        body = self._body(messages, model, max_tokens, temperature)
+        resp = await self._post_async(APIPath.LLM_DEEPSEEK_CHAT.value, api_key, body,
+                                      timeout=self.default_timeout)
+        self._record_tokens(resp, model)
+        return self._extract_content(resp)
+
+    # ── 三级降级：二级 — 备用模型 ──
+
+    def _call_fallback(self, messages: list[dict], max_tokens: int) -> str:
+        api_key = settings.qwen_api_key.get_secret_value()
+        capped = min(max_tokens, self.fallback_max_tokens)
+        body = self._body(messages, self.fallback_model, capped, self.fallback_temperature)
+        resp = self._post(APIPath.LLM_QWEN_CHAT.value, api_key, body,
+                          timeout=self.fallback_timeout)
+        self._record_tokens(resp, self.fallback_model)
+        return self._extract_content(resp)
+
+    async def _call_fallback_async(self, messages: list[dict],
+                                   max_tokens: int) -> str:
+        api_key = settings.qwen_api_key.get_secret_value()
+        capped = min(max_tokens, self.fallback_max_tokens)
+        body = self._body(messages, self.fallback_model, capped, self.fallback_temperature)
+        resp = await self._post_async(APIPath.LLM_QWEN_CHAT.value, api_key, body,
+                                      timeout=self.fallback_timeout)
+        self._record_tokens(resp, self.fallback_model)
+        return self._extract_content(resp)
+
+    # ── 三级降级：三级 — 兜底常量 ──
+
+    @staticmethod
+    def _call_last_resort() -> str:
+        logger.warning("所有模型均不可用，返回兜底常量")
+        return FALLBACK
+
+    # ═══════════════════════════════════════════════════════
+    #  公有接口
+    # ═══════════════════════════════════════════════════════
+
+    def generate(self, messages: list[dict],
+                 model: str = "deepseek-chat",
+                 max_tokens: int = 500,
+                 temperature: float = 0.9) -> str:
+        """同步生成。三级降级：主模型 → 备用模型 → FALLBACK。
+
+        P1-3: 熔断器仅守卫主模型（DeepSeek）。熔断打开时跳过一级直接尝试备用模型，
+        而不是直接返回 FALLBACK。这样备用模型仍然有机会响应。
+
+        ISSUE 1: 备用模型的成功/失败不触碰主模型熔断器。备用模型成功不代表主模型
+        恢复健康，备用模型失败也不应延长主模型冷却期。主模型熔断器完全由自身成败自治。
+        """
+        if not messages:
+            return FALLBACK
+
+        # P1-3: 熔断器仅守卫主模型。打开时跳过一级，不直接返回兜底。
+        if not self._circuit.is_open(
+                threshold=self.circuit_threshold,
+                cooldown_sec=self.circuit_cooldown):
+            # 一级：主模型
+            try:
+                result = self._retry(
+                    self._call_primary, messages, model, max_tokens, temperature)
+                self._circuit.record_success()
+                return result
+            except InfraError as e:
+                logger.warning("主模型失败: %s，降级到备用", str(e))
+                self._circuit.record_failure()
+        else:
+            logger.warning("主模型熔断中，跳过一级直接降级到备用模型")
+
+        # 二级：备用模型。备用结果不影响主模型熔断器状态。
+        try:
+            result = self._retry(
+                self._call_fallback, messages, max_tokens,
+                max_retries=2, base_delay=0.5, max_delay=10.0)
+            return result
+        except InfraError as e:
+            logger.error("备用模型也失败: %s，最终兜底", str(e))
+
+        return self._call_last_resort()
+
+    async def generate_async(self, messages: list[dict],
+                             model: str = "deepseek-chat",
+                             max_tokens: int = 500,
+                             temperature: float = 0.9) -> str:
+        """异步生成。三级降级：主模型 → 备用模型 → FALLBACK。
+
+        P1-3: 熔断器仅守卫主模型。熔断打开时跳过一级直接尝试备用模型。
+
+        ISSUE 1: 备用模型的成功/失败不触碰主模型熔断器。
+        """
+        if not messages:
+            return FALLBACK
+
+        if not self._circuit.is_open(
+                threshold=self.circuit_threshold,
+                cooldown_sec=self.circuit_cooldown):
+            try:
+                result = await self._retry_async(
+                    self._call_primary_async, messages, model, max_tokens, temperature)
+                self._circuit.record_success()
+                return result
+            except InfraError as e:
+                logger.warning("主模型失败: %s，降级到备用", str(e))
+                self._circuit.record_failure()
+        else:
+            logger.warning("主模型熔断中，跳过一级直接降级到备用模型")
+
+        # 二级：备用模型。备用结果不影响主模型熔断器状态。
+        try:
+            result = await self._retry_async(
+                self._call_fallback_async, messages, max_tokens,
+                max_retries=2, base_delay=0.5, max_delay=10.0)
+            return result
+        except InfraError as e:
+            logger.error("备用模型也失败: %s，最终兜底", str(e))
+
+        return self._call_last_resort()
+
+    # ── 工具调用 ──
+
+    def generate_with_tools(self, messages: list[dict],
+                            tools: list[dict],
+                            executor: Callable[[str, dict], str],
+                            model: str = "deepseek-chat",
+                            max_turns: int = 5,
+                            max_tokens: int = 500,
+                            temperature: float = 0.9) -> str:
+        """同步工具调用生成。LLM 最多调用工具 max_turns 轮。
+
+        executor: callable(tool_name: str, arguments: dict) -> str
+
+        P1-3: 熔断器仅守卫主模型。熔断打开时直接降级到普通生成（走完整 fallback 链）。
+        ISSUE 3: max_tokens / temperature 可配置，默认与 generate() 一致。
+        """
+        if not messages or not tools:
+            return self.generate(messages, model=model)
+
+        # P1-3: 熔断打开时跳过工具调用，降级到普通生成
+        if self._circuit.is_open(
+                threshold=self.circuit_threshold,
+                cooldown_sec=self.circuit_cooldown):
+            logger.warning("主模型熔断中，跳过工具调用，降级到普通生成")
+            return self.generate(messages, model=model)
+
+        try:
+            return self._run_tool_loop(
+                messages, tools, executor, model, max_turns,
+                max_tokens, temperature)
+        except InfraError as e:
+            logger.warning("工具调用失败: %s，降级到普通生成", str(e))
+            self._circuit.record_failure()
+            return self.generate(messages, model=model)
+
+    def _run_tool_loop(self, messages: list[dict], tools: list[dict],
+                       executor: Callable[[str, dict], str],
+                       model: str, max_turns: int,
+                       max_tokens: int, temperature: float) -> str:
+        """工具调用循环：发送 → 解析 tool_calls → 执行 → 追加结果 → 继续。"""
+        msgs = list(messages)
+        api_key = settings.deepseek_api_key.get_secret_value()
+
+        for _ in range(max_turns):
+            body = self._body(msgs, model, max_tokens, temperature, tools=tools)
+            # P0-2: timeout is forwarded to _post via **kwargs
+            resp = self._retry(
+                self._post, APIPath.LLM_DEEPSEEK_CHAT.value, api_key, body,
+                timeout=self.tool_timeout,
+                max_retries=2, base_delay=0.5, max_delay=10.0)
+            self._record_tokens(resp, model)
+
+            tcs = self._parse_tool_calls(resp)
+            if not tcs:
+                return self._extract_content(resp)
+
+            msgs.append({
+                "role": "assistant",
+                "tool_calls": tcs,
+                "content": None,
+            })
+            for tc in tcs:
+                fn = tc.get("function", tc)
+                fn_name = fn.get("name", fn.get("function", {}).get("name", ""))
+                try:
+                    fn_args = json.loads(fn.get("arguments", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    fn_args = {}
+                result = executor(fn_name, fn_args)
+                msgs.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", ""),
+                    "content": result,
+                })
+
+        # 超过 max_turns，再做最后一次非工具调用
+        body = self._body(msgs, model, max_tokens, temperature)
+        resp = self._retry(
+            self._post, APIPath.LLM_DEEPSEEK_CHAT.value, api_key, body,
+            timeout=self.tool_timeout,
+            max_retries=2, base_delay=0.5, max_delay=10.0)
+        self._record_tokens(resp, model)
+        return self._extract_content(resp)
+
+    @staticmethod
+    def _parse_tool_calls(resp: dict) -> list[dict]:
+        """从 API 响应提取工具调用列表。兼容 DeepSeek/Qwen 多种格式。"""
+        msg = resp.get("choices", [{}])[0].get("message", {})
+        if not msg:
+            return []
+        tcs = msg.get("tool_calls", [])
+        if not tcs:
+            return []
+        parsed = []
+        for tc in tcs:
+            fn = tc.get("function", {})
+            parsed.append({
+                "id": tc.get("id", ""),
+                "type": tc.get("type", "function"),
+                "function": {
+                    "name": fn.get("name", ""),
+                    "arguments": fn.get("arguments", "{}"),
+                },
+            })
+        return parsed
+
+
+# ── 模块级单例 ──
+llm_client = LLMClient()
+
+=== infra/embedding/config.py ===
+"""
+嵌入模型配置。从 core.config.settings 读取，跨平台模型路径处理。
+"""
+import os
+from pathlib import Path
+
+from core.config import settings
+
+# ── 不可变常量 ──
+USE_FP16: bool = False  # CPU 环境必须关闭，PyTorch CPU 对 fp16 支持残缺
+
+
+def resolve_model_path() -> str:
+    """跨平台解析模型路径。
+
+    优先级：环境变量 BGE_MODEL_PATH > HF_HOME 缓存自动检测 > 用户默认缓存 > 回退路径。
+    支持 HuggingFace 新旧两种缓存目录格式。
+    """
+    # 1. 环境变量优先
+    env_path = os.getenv("BGE_MODEL_PATH", "")
+    if env_path and Path(env_path).exists():
+        return env_path
+
+    model_name = settings.embedding_model_name  # e.g. "BAAI/bge-m3"
+    org, name = (model_name.split("/", 1) + [""])[:2]
+
+    # 2. 自动检测 HuggingFace 缓存
+    hf_home = os.getenv("HF_HOME", str(Path.home() / ".cache" / "huggingface"))
+
+    # 新格式：~/.cache/huggingface/hub/models--{org}--{name}/snapshots/<hash>
+    snapshots_dir = Path(hf_home) / "hub" / f"models--{org}--{name}" / "snapshots"
+    if snapshots_dir.is_dir():
+        snapshots = sorted(
+            [d for d in snapshots_dir.iterdir() if d.is_dir()],
+            reverse=True,
+        )
+        if snapshots:
+            return str(snapshots[0])
+
+    # 旧格式：~/.cache/huggingface/hub/{org}/{name}
+    legacy_dir = Path(hf_home) / "hub" / model_name
+    if legacy_dir.exists():
+        return str(legacy_dir)
+
+    # 3. 默认回退路径（向后兼容）
+    return str(Path.home() / ".cache" / "huggingface" / "hub" / model_name)
+
+
+MODEL_PATH: str = resolve_model_path()
+
+=== infra/embedding/embedder.py ===
+"""
+BGE-M3 嵌入模型加载器。检索/写入独立锁，线程安全单例。
+"""
+import threading
+
+import numpy as np
+
+from core.config import settings
+from core.exceptions import InfraError
+from core.logging import get_logger
+
+from .config import MODEL_PATH, USE_FP16
+
+_logger = get_logger(__name__)
+
+_embedder: "BGEEmbedder | None" = None
+_lock = threading.RLock()
+
+
+class BGEEmbedder:
+    """BGE-M3 封装。Query/Doc 分锁，检索写入互不阻塞。"""
+
+    def __init__(self):
+        try:
+            from FlagEmbedding import FlagModel
+        except ImportError as e:
+            raise InfraError(
+                f"FlagEmbedding 未安装，无法加载 BGE-M3 模型: {e}",
+                error_code="INF_EMBED_IMPORT",
+            ) from e
+
+        _logger.info("加载嵌入模型: %s (dim=%d)", MODEL_PATH, settings.vector_dim)
+
+        try:
+            self.model = FlagModel(
+                MODEL_PATH,
+                query_instruction_for_retrieval=settings.query_instruction,
+                use_fp16=USE_FP16,
+            )
+        except Exception as e:
+            raise InfraError(
+                f"加载 BGE-M3 模型失败: {e}",
+                error_code="INF_EMBED_LOAD",
+            ) from e
+
+        self._query_lock = threading.RLock()
+        self._doc_lock = threading.RLock()
+        self.model_name = settings.embedding_model_name
+        self.vector_dim = settings.vector_dim
+
+    def encode_query(self, queries: list[str]) -> np.ndarray:
+        """编码查询向量。使用查询锁，与文档编码互不阻塞。"""
+        if not queries:
+            raise InfraError("查询列表为空", error_code="INF_EMBED_EMPTY_QUERY")
+        with self._query_lock:
+            vec = self.model.encode_queries(queries)
+            return np.ascontiguousarray(vec)
+
+    def encode_doc(self, docs: list[str]) -> np.ndarray:
+        """编码文档向量。使用文档锁，与查询编码互不阻塞。"""
+        if not docs:
+            raise InfraError("文档列表为空", error_code="INF_EMBED_EMPTY_DOC")
+        with self._doc_lock:
+            vec = self.model.encode(docs)
+            return np.ascontiguousarray(vec)
+
+
+def get_embedder() -> BGEEmbedder:
+    """获取 BGEEmbedder 单例。双重检查锁 + RLock。首次加载时预热。"""
+    global _embedder
+    if _embedder is None:
+        with _lock:
+            if _embedder is None:
+                _embedder = BGEEmbedder()
+                _warmup(_embedder)
+    return _embedder
+
+
+def _warmup(embedder: BGEEmbedder) -> None:
+    """首次加载后预热：跑一次 dummy query 触发 JIT/模型初始化。"""
+    try:
+        _logger.info("嵌入模型预热中...")
+        _ = embedder.encode_query(["预热"])
+        _logger.info("嵌入模型预热完成")
+    except Exception as e:
+        _logger.warning("嵌入模型预热失败（不影响正常使用）: %s", e)
+
+=== _env_setup.py ===
+"""
+_env_setup.py — 环境变量预植入层
+===================================
+
+**此文件必须是任何入口点（_launcher.py / main.py / cli.py）的第一个导入。**
+在 torch、numpy 等原生库被 import 之前设置线程控制环境变量，
+防止 OpenMP / BLAS / MKL 线程爆炸（尤其在 Windows 上）。
+
+约定：
+- 每个环境变量优先从 ``core.config.settings`` 读取对应属性，
+  若属性不存在或 settings 不可导入，则回退到硬编码默认值。
+- 模块被 import 时立即执行所有 os.environ 设置，无需调用任何函数。
+- 不依赖 core.config 以外的任何项目模块。
+"""
+
+import os as _os
+
+# ──────────────────────────────────────────────
+# 1. 尝试读取 settings（可选）
+# ──────────────────────────────────────────────
+_settings = None
+try:
+    from core.config import settings as _settings
+except Exception:
+    _settings = None
+
+
+def _get(key: str, default: str) -> str:
+    """从 settings 读取值，不存在则用默认值。"""
+    if _settings is not None:
+        val = getattr(_settings, key, None)
+        if val is not None:
+            return str(val)
+    return default
+
+
+# ──────────────────────────────────────────────
+# 2. 线程控制（防止 PyTorch / NumPy 线程爆炸）
+# ──────────────────────────────────────────────
+_os.environ.setdefault("OMP_NUM_THREADS", _get("omp_num_threads", "1"))
+_os.environ.setdefault("OPENBLAS_NUM_THREADS", _get("openblas_num_threads", "1"))
+_os.environ.setdefault("MKL_NUM_THREADS", _get("mkl_num_threads", "1"))
+_os.environ.setdefault("NUMEXPR_NUM_THREADS", _get("numexpr_num_threads", "1"))
+
+# ──────────────────────────────────────────────
+# 3. Windows 特定：允许重复加载 OpenMP 库
+# ──────────────────────────────────────────────
+_os.environ.setdefault("KMP_DUPLICATE_LIB_OK", _get("kmp_duplicate_lib_ok", "TRUE"))
+
+# ──────────────────────────────────────────────
+# 4. 设备控制（CPU-only）
+# ──────────────────────────────────────────────
+_os.environ.setdefault("CUDA_VISIBLE_DEVICES", _get("cuda_visible_devices", ""))
+
+# ──────────────────────────────────────────────
+# 5. Protobuf 兼容性
+# ──────────────────────────────────────────────
+_os.environ.setdefault(
+    "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION",
+    _get("protocol_buffers_python_implementation", "python"),
+)
+
+# ──────────────────────────────────────────────
+# 清理模块级临时符号，避免污染 import 方的命名空间
+# ──────────────────────────────────────────────
+del _os, _get, _settings
+
+=== _launcher.py ===
+#!/usr/bin/env python3
+"""
+白槿 v2 Unified Launcher — ALL entry points MUST route through this file.
+
+Startup sequence (in order, each step depends on the previous):
+  1. ``import _env_setup`` — environment bootstrap. Runs before any
+     other import so native libraries see the correct environment.
+  2. ``sys.path`` — ensure the project root is on the import path.
+  3. ``setup_root_logger()`` — install structured JSON log handlers.
+  4. HTTP server — ASGI lifespan manages migrations + container start/stop
+     + connection pool close. uvicorn handles signals natively.
+
+Flags:
+  --foreground-debug   Skip background-thread launch (useful for pdb/IDE
+                       debugging and single-step tracing).
+
+Environment:
+  BAIJIN_CONFIG        Path to a ``.env``-style config file.  Consumed by
+                       ``_env_setup`` before any other import — do NOT set
+                       it after the process has started.
+"""
+
+from __future__ import annotations
+
+# ═══════════════════════════════════════════════════════════════════════
+# 1. Environment bootstrap — MUST be the first executable line.
+#    _env_setup resolves BAIJIN_CONFIG, sets encoding/threading vars,
+#    and patches sys.path / os.environ before any library import sees
+#    the stale state.
+# ═══════════════════════════════════════════════════════════════════════
+import _env_setup  # noqa: E402,F401
+
+# ═══════════════════════════════════════════════════════════════════════
+# 2. Project root on sys.path (idempotent).
+# ═══════════════════════════════════════════════════════════════════════
+import sys
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Internal helpers
+# ═══════════════════════════════════════════════════════════════════════
+
+def _build_shutdown_callback() -> "Callable[[], None]":
+    """Return a zero-argument callable suitable for signal handlers.
+
+    The callback stops all DI-registered LifecycleComponents (in reverse
+    topological order) and then closes the database connection pool.
+    """
+    from core.container import container as _di
+    from infra.database import db_pool as _pool
+
+    def _on_shutdown() -> None:
+        from core.logging import get_logger
+        _log = get_logger(__name__)
+        try:
+            _log.info("停止 DI 容器组件…")
+            _di.stop_all()
+        except Exception:
+            _log.exception("DI 停止阶段异常")
+        try:
+            _log.info("关闭数据库连接池…")
+            _pool.close()
+        except Exception:
+            _log.exception("数据库连接池关闭异常")
+
+    return _on_shutdown
+
+
+def _build_lifespan():
+    """返回 ASGI lifespan 上下文管理器，由 uvicorn 管理生命周期。
+
+    uvicorn 启动时自动安装自己的 SIGINT/SIGTERM 处理器，
+    我们必须通过 lifespan 的 startup/shutdown 钩子来执行
+    迁移、容器启停、连接池关闭，避免信号处理器被覆盖。
+    """
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def lifespan(app):
+        # ── startup ──
+        from core.logging import get_logger
+        _log = get_logger(__name__)
+        _log.info("执行数据库迁移…")
+        from infra.database import db_pool
+        from infra.database.migrations import run_migrations
+        run_migrations(db_pool)
+
+        _log.info("启动 DI 容器…")
+        from core.container import container as di_container
+        di_container.start_all()
+
+        yield  # 服务运行中
+
+        # ── shutdown ──
+        _log.info("停止 DI 容器组件…")
+        try:
+            from core.container import container as _di
+            _di.stop_all()
+        except Exception:
+            _log.exception("DI 停止阶段异常")
+
+        _log.info("关闭数据库连接池…")
+        try:
+            from infra.database import db_pool as _pool
+            _pool.close()
+        except Exception:
+            _log.exception("数据库连接池关闭异常")
+
+    return lifespan
+
+
+def _start_http_server(debug: bool = False) -> None:
+    """Launch the HTTP server.
+
+    Prefer ``app.server.run_server()`` when the module exists (v2 target
+    architecture).  Fall back to uvicorn + ``main:app`` for backward
+    compatibility during the migration window.
+
+    生命周期通过 ASGI lifespan 管理，uvicorn 自动处理信号。
+    """
+    try:
+        import app.server  # noqa: F401
+    except ImportError:
+        app_server_available = False
+    else:
+        app_server_available = True
+
+    lifespan = _build_lifespan()
+
+    if app_server_available:
+        from app.server import run_server
+        run_server(debug=debug, lifespan=lifespan)
+    else:
+        import uvicorn
+        import asyncio
+
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+        import main as _main_module
+        old_app = _main_module.app
+
+        # 直接注入 lifespan，完全保留原应用所有能力（路由/中间件/WebSocket/SSE）
+        old_app.router.lifespan_context = lifespan
+
+        uvicorn.run(
+            old_app,
+            host="127.0.0.1",
+            port=8080,
+            log_level="debug" if debug else "info",
+            reload=False,
+            workers=1,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# main()
+# ═══════════════════════════════════════════════════════════════════════
+
+def main(*, debug: bool = False) -> None:
+    """Execute the full startup sequence.
+
+    生命周期管理：
+    - 正常模式：迁移 + 容器启停 + 连接池关闭 → ASGI lifespan（uvicorn 统一管理信号）
+    - 非 HTTP 模式（--foreground-debug）：手动安装信号处理器
+
+    Parameters
+    ----------
+    debug : bool
+        When ``True``, background threads are skipped (``--foreground-debug``).
+    """
+    # ── 3. Structured logging ──────────────────────────────────────────
+    from core.config import settings
+    from core.logging import setup_root_logger, get_logger
+
+    setup_root_logger(settings.log_level)
+    _log = get_logger(__name__)
+    _log.info(
+        "白槿 v2 启动 (debug=%s config_version=%s)",
+        debug, settings.config_version,
+    )
+
+    # ── 4. HTTP server（迁移 + 容器生命周期由 ASGI lifespan 管理）──────
+    # 注意：不在 uvicorn 之前安装信号处理器 —— uvicorn 会覆盖信号处理器，
+    # 改用 ASGI lifespan 的 startup/shutdown 钩子管理生命周期。
+    _log.info("启动 HTTP 服务器…")
+    _start_http_server(debug=debug)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# __main__ guard — Windows multiprocessing freeze support + CLI parsing
+# ═══════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import argparse
+    import multiprocessing
+
+    multiprocessing.freeze_support()
+
+    parser = argparse.ArgumentParser(
+        description="白槿 v2 unified launcher — all entry points route through here.",
+    )
+    parser.add_argument(
+        "--foreground-debug",
+        action="store_true",
+        dest="debug",
+        help="Skip background thread launch (attach pdb / IDE debugger).",
+    )
+    args = parser.parse_args()
+
+    main(debug=args.debug)
+
+=== infra/database/__init__.py ===
+"""
+infra.database — SQLite connection pool with WAL mode and incremental migrations.
+
+Public API
+----------
+- ``DatabasePool`` — thread-safe connection pool (max 5, RLock), WAL with
+  Windows fallback, auto-transaction on critical writes.
+- ``get_connection`` — context manager that acquires a connection from the
+  pool and automatically returns it on exit (instance method on DatabasePool).
+
+Usage::
+
+    from infra.database import DatabasePool
+
+    pool = DatabasePool()
+
+    # One-shot transactional write
+    pool.execute("INSERT INTO items (id, content) VALUES (?, ?)", ("X", "hello"))
+
+    # Multi-statement DDL
+    pool.executescript("CREATE TABLE IF NOT EXISTS ...")
+
+    # Low-level access (no auto-transaction — caller manages commit)
+    with pool.get_connection() as conn:
+        rows = conn.execute("SELECT * FROM items").fetchall()
+"""
+
+from __future__ import annotations
+
+from infra.database.connection import DatabasePool
+
+__all__ = ["DatabasePool", "db_pool", "get_connection"]
+
+# Module-level singleton pool so that ``get_connection`` is a bound method.
+#
+# IMPORTANT: db_pool 在首次导入时初始化，需确保 core.config 已加载（在 infra 导入之前导入 core）。
+# 这是启动顺序约定，不在此处做代码层面延迟初始化。
+db_pool = DatabasePool()
+
+# ``get_connection`` is a bound instance method on ``db_pool``, callable as
+# ``get_connection()`` without an explicit ``self`` argument.
+get_connection = db_pool.get_connection
+
+=== infra/database/migrations.py ===
+"""
+Database migration framework — versioned, ordered, idempotent.
+
+How it works:
+- Every migration is a ``(version, description, sql)`` tuple in the
+  ``MIGRATIONS`` list.
+- ``run_migrations(pool)`` creates the ``_migrations`` tracking table
+  (if needed), queries already-applied versions, and runs any pending
+  migrations in ascending version order.
+- Each migration and its tracking insert execute inside a single
+  transaction — applied or skipped atomically.
+"""
+
+from __future__ import annotations
+
+from core.logging import get_logger
+from core.utils import fmt_ts, now_ts
+
+logger = get_logger(__name__)
+
+__all__ = ["MIGRATIONS", "run_migrations"]
+
+# ══════════════════════════════════════════════════════════════════════
+# Migration registry
+# ══════════════════════════════════════════════════════════════════════
+
+MIGRATIONS: list[tuple[int, str, str]] = [
+    # (version, description, sql_statement)
+    # Add new migrations at the end in ascending version order.
+    # Example:
+    # (1, "create items table", "CREATE TABLE IF NOT EXISTS items (...);"),
+]
+
+# ══════════════════════════════════════════════════════════════════════
+# Runner
+# ══════════════════════════════════════════════════════════════════════
+
+
+def run_migrations(pool: "DatabasePool") -> None:
+    """Execute all pending migrations against *pool* in version order.
+
+    Parameters
+    ----------
+    pool : DatabasePool
+        The connection pool to run migrations against (imported from
+        ``infra.database.connection``).
+    """
+    # ── ensure tracking table exists ─────────────────────────────────
+    with pool.get_connection() as conn:
+        conn.execute("BEGIN TRANSACTION")
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS _migrations (
+                    version     INTEGER PRIMARY KEY,
+                    description TEXT    NOT NULL,
+                    executed_at TEXT    NOT NULL
+                )
+            """)
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+
+    # ── determine already-applied versions ───────────────────────────
+    with pool.get_connection() as conn:
+        try:
+            rows = conn.execute("SELECT version FROM _migrations ORDER BY version").fetchall()
+            applied: set[int] = {r["version"] for r in rows}
+        except Exception:
+            applied = set()
+
+    # ── sort and filter ──────────────────────────────────────────────
+    pending = [m for m in MIGRATIONS if m[0] not in applied]
+    pending.sort(key=lambda m: m[0])
+
+    if not pending:
+        logger.debug("No pending migrations (applied: %d).", len(applied))
+        return
+
+    logger.info(
+        "Pending migrations: %d (applied: %d, total registered: %d).",
+        len(pending), len(applied), len(MIGRATIONS),
+    )
+
+    # ── execute each pending migration in its own transaction ────────
+    for version, description, sql in pending:
+        logger.info("Applying migration %d — %s ...", version, description)
+
+        with pool.get_connection() as conn:
+            try:
+                conn.execute("BEGIN TRANSACTION")
+                conn.execute(sql)
+                conn.execute(
+                    "INSERT INTO _migrations (version, description, executed_at) "
+                    "VALUES (?, ?, ?)",
+                    (version, description, fmt_ts(now_ts())),
+                )
+                conn.commit()
+                logger.info("Migration %d applied successfully.", version)
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                logger.exception(
+                    "Migration %d (%s) FAILED — aborting migration run.", version, description
+                )
+                raise
+
+    logger.info("All %d pending migration(s) applied.", len(pending))
+
+=== infra/llm_client/client.py ===
+"""
+白槿 v2 — LLM 客户端：三级降级 + 熔断器 + 指数退避 + Token 统计 + trace_id 传播。
+
+铁律：每函数 ≤ 20 行，先处理异常，零硬编码，锁全用 RLock。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import random
+import threading
+import time
+from typing import Any, Callable
+
+import httpx
+
+from core.config import settings
+from core.constants import APIPath
+from core.exceptions import InfraError
+from core.logging import get_logger, trace_id_var
+from core.metrics import metrics
+
+logger = get_logger(__name__)
+
+# ── 硬编码兜底常量（运行时优先读 core.config.settings）──
+FALLBACK = "嗯…我暂时说不了话。"
+
+# 超时 / 熔断 / 重试 兜底值（模块级常量，__init__ 中优先从 settings 读取）
+DEFAULT_TIMEOUT = 45.0
+FALLBACK_TIMEOUT = 30.0
+TOOL_TIMEOUT = 30.0  # 兜底默认值，运行时优先从 settings.llm_tool_timeout 读取
+
+CIRCUIT_THRESHOLD = 3
+CIRCUIT_COOLDOWN = 30.0
+
+RETRY_MAX = 3
+RETRY_BASE = 1.0
+RETRY_MAX_SEC = 60.0
+RETRY_JITTER = 0.1
+
+# 备用模型 兜底值（__init__ 中优先从 settings 读取）
+FALLBACK_MODEL = "qwen-turbo"
+FALLBACK_MAX_TOKENS = 256
+FALLBACK_TEMPERATURE = 0.7
+
+
+def _jittered_delay(attempt: int, base: float = RETRY_BASE,
+                    max_delay: float = RETRY_MAX_SEC) -> float:
+    """指数退避: base * 2^attempt，上限 max_delay，±10% 抖动。（P1-4: 接受自定义参数）"""
+    raw = base * (2 ** attempt)
+    bounded = min(raw, max_delay)
+    return bounded * (1.0 + random.uniform(-RETRY_JITTER, RETRY_JITTER))
+
+
+class CircuitBreaker:
+    """熔断器：连续失败 ≥ 阈值 → 冷却期内直接拒绝，线程安全（RLock）。"""
+
+    def __init__(self, threshold: int = CIRCUIT_THRESHOLD,
+                 cooldown_sec: float = CIRCUIT_COOLDOWN):
+        self._lock = threading.RLock()
+        self._threshold = threshold
+        self._cooldown = cooldown_sec
+        self._failure_count = 0
+        self._last_failure_time: float = 0.0
+
+    @property
+    def failure_count(self) -> int:
+        with self._lock:
+            return self._failure_count
+
+    @property
+    def last_failure_time(self) -> float:
+        with self._lock:
+            return self._last_failure_time
+
+    def is_open(self, threshold: int | None = None,
+                cooldown_sec: float | None = None) -> bool:
+        """True = 熔断中；冷却期满自动半开。支持运行时覆盖阈值/冷却（热更）。"""
+        thresh = threshold if threshold is not None else self._threshold
+        cool = cooldown_sec if cooldown_sec is not None else self._cooldown
+        with self._lock:
+            if self._failure_count < thresh:
+                return False
+            elapsed = time.monotonic() - self._last_failure_time
+            if elapsed >= cool:
+                self._failure_count = 0
+                self._last_failure_time = 0.0
+                return False
+            return True
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failure_count = 0
+            self._last_failure_time = 0.0
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._failure_count += 1
+            self._last_failure_time = time.monotonic()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._failure_count = 0
+            self._last_failure_time = 0.0
+
+
+class LLMClient:
+    """LLM 客户端：同步/异步双接口，三级降级，指数退避，线程安全。"""
+
+    def __init__(self):
+        # ISSUE 5: 备用模型参数优先从 settings 读取，回退到模块常量
+        self.fallback_model = getattr(settings, 'llm_fallback_model', FALLBACK_MODEL)
+        self.fallback_max_tokens = int(
+            getattr(settings, 'llm_fallback_max_tokens', FALLBACK_MAX_TOKENS))
+        self.fallback_temperature = float(
+            getattr(settings, 'llm_fallback_temperature', FALLBACK_TEMPERATURE))
+
+        self._circuit = CircuitBreaker(
+            threshold=self.circuit_threshold,
+            cooldown_sec=self.circuit_cooldown)
+        self._sync_client: httpx.Client | None = None
+        self._client_lock = threading.RLock()
+
+    # ── ISSUE 2: 属性实时从 settings 读取，支持热重载无需重启 ──
+
+    @property
+    def default_timeout(self) -> float:
+        return float(getattr(settings, 'llm_default_timeout', DEFAULT_TIMEOUT))
+
+    @property
+    def fallback_timeout(self) -> float:
+        return float(getattr(settings, 'llm_fallback_timeout', FALLBACK_TIMEOUT))
+
+    @property
+    def tool_timeout(self) -> float:
+        return float(getattr(settings, 'llm_tool_timeout', TOOL_TIMEOUT))
+
+    @property
+    def circuit_threshold(self) -> int:
+        return int(getattr(settings, 'llm_circuit_threshold', CIRCUIT_THRESHOLD))
+
+    @property
+    def circuit_cooldown(self) -> float:
+        return float(getattr(settings, 'llm_circuit_cooldown', CIRCUIT_COOLDOWN))
+
+    @property
+    def retry_max(self) -> int:
+        return int(getattr(settings, 'llm_retry_max', RETRY_MAX))
+
+    @property
+    def retry_base(self) -> float:
+        return float(getattr(settings, 'llm_retry_base', RETRY_BASE))
+
+    @property
+    def retry_max_sec(self) -> float:
+        return float(getattr(settings, 'llm_retry_max_sec', RETRY_MAX_SEC))
+
+    # ── 内部：客户端复用 ──
+
+    def _get_client(self) -> httpx.Client:
+        with self._client_lock:
+            if self._sync_client is None or self._sync_client.is_closed:
+                self._sync_client = httpx.Client(
+                    timeout=self.default_timeout,
+                    limits=httpx.Limits(max_keepalive_connections=4),
+                )
+            return self._sync_client
+
+    # ── 内部：请求头 / 请求体 ──
+
+    @staticmethod
+    def _headers(api_key: str) -> dict[str, str]:
+        h = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        trace_id = trace_id_var.get()
+        if trace_id:
+            h["x-trace-id"] = trace_id
+        return h
+
+    @staticmethod
+    def _body(messages: list[dict], model: str,
+              max_tokens: int, temperature: float,
+              tools: list[dict] | None = None) -> dict:
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if tools:
+            body["tools"] = tools
+        return body
+
+    # ── 内部：Token 统计 ──
+
+    @staticmethod
+    def _record_tokens(resp_json: dict, model: str) -> None:
+        usage = resp_json.get("usage", {})
+        total = usage.get("total_tokens", 0)
+        if total > 0:
+            metrics.record_token(int(total), model=model)
+
+    @staticmethod
+    def _extract_content(resp_json: dict) -> str:
+        content = resp_json["choices"][0]["message"].get("content", "")
+        return content.strip() if content else FALLBACK
+
+    # ── 内部：同步 HTTP 请求 ──
+
+    def _post(self, url: str, api_key: str, body: dict,
+              timeout: float | None = None) -> dict:
+        """同步非流式 POST，返回完整 JSON。异常透传。"""
+        client = self._get_client()
+        kwargs: dict = {"headers": self._headers(api_key), "json": body}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        resp = client.post(url, **kwargs)
+        resp.raise_for_status()
+        return resp.json()
+
+    # ── 内部：异步 HTTP 请求 ──
+
+    async def _post_async(self, url: str, api_key: str, body: dict,
+                          timeout: float | None = None) -> dict:
+        """异步非流式 POST。每次创建新 AsyncClient 避免跨 loop 共享。"""
+        kwargs: dict = {"headers": self._headers(api_key), "json": body}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        async with httpx.AsyncClient(timeout=timeout or self.default_timeout) as client:
+            resp = await client.post(url, **kwargs)
+            resp.raise_for_status()
+            return resp.json()
+
+    # ── 内部：指数退避封装 ──
+
+    def _retry(self, fn, *args,
+               max_retries: int | None = None,
+               base_delay: float | None = None,
+               max_delay: float | None = None,
+               **kwargs):
+        """同步指数退避重试。鉴权错误直接抛 InfraError，限流/网络按退避重试。
+
+        P0-2: 接受 **kwargs 并转发给 fn（如上层的 timeout=TOOL_TIMEOUT）。
+        P2-6: 默认重试参数优先来自实例属性（settings），兜底模块常量。
+
+        ISSUE 4: 仅重试网络/HTTP 层异常，不捕获 TypeError/ValueError/KeyError/
+        AttributeError/NameError 等编程错误，避免凭退避掩盖代码 bug。
+        """
+        max_retries = max_retries if max_retries is not None else self.retry_max
+        base_delay = base_delay if base_delay is not None else self.retry_base
+        max_delay = max_delay if max_delay is not None else self.retry_max_sec
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                return fn(*args, **kwargs)
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                code = e.response.status_code
+                if code in (401, 403):
+                    raise InfraError(f"LLM鉴权失败({code})") from e
+                if code == 429:
+                    logger.warning("API 限流(429)，第 %d 次重试", attempt + 1)
+                else:
+                    logger.warning("HTTP %d，第 %d 次重试", code, attempt + 1)
+            except (httpx.TimeoutException, httpx.ConnectError,
+                    httpx.NetworkError, OSError) as e:
+                last_error = e
+                logger.warning("网络错误 %s，第 %d 次重试",
+                               type(e).__name__, attempt + 1)
+            if attempt < max_retries - 1:
+                # P1-4: 传递自定义 base / max_delay
+                time.sleep(_jittered_delay(attempt, base_delay, max_delay))
+        raise InfraError(f"LLM 请求失败(重试 {max_retries} 次): {last_error}") from last_error
+
+    async def _retry_async(self, fn, *args,
+                           max_retries: int | None = None,
+                           base_delay: float | None = None,
+                           max_delay: float | None = None,
+                           **kwargs):
+        """异步指数退避重试。
+
+        P0-2: 接受 **kwargs 并转发给 fn。
+        P2-6: 默认重试参数优先来自实例属性（settings），兜底模块常量。
+
+        ISSUE 4: 仅重试网络/HTTP 层异常，不捕获编程错误（TypeError/ValueError/
+        KeyError/AttributeError/NameError），避免凭退避掩盖代码 bug。
+        """
+        max_retries = max_retries if max_retries is not None else self.retry_max
+        base_delay = base_delay if base_delay is not None else self.retry_base
+        max_delay = max_delay if max_delay is not None else self.retry_max_sec
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                return await fn(*args, **kwargs)
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                code = e.response.status_code
+                if code in (401, 403):
+                    raise InfraError(f"LLM鉴权失败({code})") from e
+                if code == 429:
+                    logger.warning("API 限流(429)，第 %d 次重试", attempt + 1)
+                else:
+                    logger.warning("HTTP %d，第 %d 次重试", code, attempt + 1)
+            except (httpx.TimeoutException, httpx.ConnectError,
+                    httpx.NetworkError, OSError) as e:
+                last_error = e
+                logger.warning("网络错误 %s，第 %d 次重试",
+                               type(e).__name__, attempt + 1)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(_jittered_delay(attempt, base_delay, max_delay))
+        raise InfraError(f"LLM 请求失败(重试 {max_retries} 次): {last_error}") from last_error
+
+    # ── 三级降级：一级 — 主模型 ──
+
+    def _call_primary(self, messages: list[dict], model: str,
+                      max_tokens: int, temperature: float) -> str:
+        api_key = settings.deepseek_api_key.get_secret_value()
+        body = self._body(messages, model, max_tokens, temperature)
+        resp = self._post(APIPath.LLM_DEEPSEEK_CHAT.value, api_key, body,
+                          timeout=self.default_timeout)
+        self._record_tokens(resp, model)
+        return self._extract_content(resp)
+
+    async def _call_primary_async(self, messages: list[dict], model: str,
+                                  max_tokens: int, temperature: float) -> str:
+        api_key = settings.deepseek_api_key.get_secret_value()
+        body = self._body(messages, model, max_tokens, temperature)
+        resp = await self._post_async(APIPath.LLM_DEEPSEEK_CHAT.value, api_key, body,
+                                      timeout=self.default_timeout)
+        self._record_tokens(resp, model)
+        return self._extract_content(resp)
+
+    # ── 三级降级：二级 — 备用模型 ──
+
+    def _call_fallback(self, messages: list[dict], max_tokens: int) -> str:
+        api_key = settings.qwen_api_key.get_secret_value()
+        capped = min(max_tokens, self.fallback_max_tokens)
+        body = self._body(messages, self.fallback_model, capped, self.fallback_temperature)
+        resp = self._post(APIPath.LLM_QWEN_CHAT.value, api_key, body,
+                          timeout=self.fallback_timeout)
+        self._record_tokens(resp, self.fallback_model)
+        return self._extract_content(resp)
+
+    async def _call_fallback_async(self, messages: list[dict],
+                                   max_tokens: int) -> str:
+        api_key = settings.qwen_api_key.get_secret_value()
+        capped = min(max_tokens, self.fallback_max_tokens)
+        body = self._body(messages, self.fallback_model, capped, self.fallback_temperature)
+        resp = await self._post_async(APIPath.LLM_QWEN_CHAT.value, api_key, body,
+                                      timeout=self.fallback_timeout)
+        self._record_tokens(resp, self.fallback_model)
+        return self._extract_content(resp)
+
+    # ── 三级降级：三级 — 兜底常量 ──
+
+    @staticmethod
+    def _call_last_resort() -> str:
+        logger.warning("所有模型均不可用，返回兜底常量")
+        return FALLBACK
+
+    # ═══════════════════════════════════════════════════════
+    #  公有接口
+    # ═══════════════════════════════════════════════════════
+
+    def generate(self, messages: list[dict],
+                 model: str = "deepseek-chat",
+                 max_tokens: int = 500,
+                 temperature: float = 0.9) -> str:
+        """同步生成。三级降级：主模型 → 备用模型 → FALLBACK。
+
+        P1-3: 熔断器仅守卫主模型（DeepSeek）。熔断打开时跳过一级直接尝试备用模型，
+        而不是直接返回 FALLBACK。这样备用模型仍然有机会响应。
+
+        ISSUE 1: 备用模型的成功/失败不触碰主模型熔断器。备用模型成功不代表主模型
+        恢复健康，备用模型失败也不应延长主模型冷却期。主模型熔断器完全由自身成败自治。
+        """
+        if not messages:
+            return FALLBACK
+
+        # P1-3: 熔断器仅守卫主模型。打开时跳过一级，不直接返回兜底。
+        if not self._circuit.is_open(
+                threshold=self.circuit_threshold,
+                cooldown_sec=self.circuit_cooldown):
+            # 一级：主模型
+            try:
+                result = self._retry(
+                    self._call_primary, messages, model, max_tokens, temperature)
+                self._circuit.record_success()
+                return result
+            except InfraError as e:
+                logger.warning("主模型失败: %s，降级到备用", str(e))
+                self._circuit.record_failure()
+        else:
+            logger.warning("主模型熔断中，跳过一级直接降级到备用模型")
+
+        # 二级：备用模型。备用结果不影响主模型熔断器状态。
+        try:
+            result = self._retry(
+                self._call_fallback, messages, max_tokens,
+                max_retries=2, base_delay=0.5, max_delay=10.0)
+            return result
+        except InfraError as e:
+            logger.error("备用模型也失败: %s，最终兜底", str(e))
+
+        return self._call_last_resort()
+
+    async def generate_async(self, messages: list[dict],
+                             model: str = "deepseek-chat",
+                             max_tokens: int = 500,
+                             temperature: float = 0.9) -> str:
+        """异步生成。三级降级：主模型 → 备用模型 → FALLBACK。
+
+        P1-3: 熔断器仅守卫主模型。熔断打开时跳过一级直接尝试备用模型。
+
+        ISSUE 1: 备用模型的成功/失败不触碰主模型熔断器。
+        """
+        if not messages:
+            return FALLBACK
+
+        if not self._circuit.is_open(
+                threshold=self.circuit_threshold,
+                cooldown_sec=self.circuit_cooldown):
+            try:
+                result = await self._retry_async(
+                    self._call_primary_async, messages, model, max_tokens, temperature)
+                self._circuit.record_success()
+                return result
+            except InfraError as e:
+                logger.warning("主模型失败: %s，降级到备用", str(e))
+                self._circuit.record_failure()
+        else:
+            logger.warning("主模型熔断中，跳过一级直接降级到备用模型")
+
+        # 二级：备用模型。备用结果不影响主模型熔断器状态。
+        try:
+            result = await self._retry_async(
+                self._call_fallback_async, messages, max_tokens,
+                max_retries=2, base_delay=0.5, max_delay=10.0)
+            return result
+        except InfraError as e:
+            logger.error("备用模型也失败: %s，最终兜底", str(e))
+
+        return self._call_last_resort()
+
+    # ── 工具调用 ──
+
+    def generate_with_tools(self, messages: list[dict],
+                            tools: list[dict],
+                            executor: Callable[[str, dict], str],
+                            model: str = "deepseek-chat",
+                            max_turns: int = 5,
+                            max_tokens: int = 500,
+                            temperature: float = 0.9) -> str:
+        """同步工具调用生成。LLM 最多调用工具 max_turns 轮。
+
+        executor: callable(tool_name: str, arguments: dict) -> str
+
+        P1-3: 熔断器仅守卫主模型。熔断打开时直接降级到普通生成（走完整 fallback 链）。
+        ISSUE 3: max_tokens / temperature 可配置，默认与 generate() 一致。
+        """
+        if not messages or not tools:
+            return self.generate(messages, model=model)
+
+        # P1-3: 熔断打开时跳过工具调用，降级到普通生成
+        if self._circuit.is_open(
+                threshold=self.circuit_threshold,
+                cooldown_sec=self.circuit_cooldown):
+            logger.warning("主模型熔断中，跳过工具调用，降级到普通生成")
+            return self.generate(messages, model=model)
+
+        try:
+            return self._run_tool_loop(
+                messages, tools, executor, model, max_turns,
+                max_tokens, temperature)
+        except InfraError as e:
+            logger.warning("工具调用失败: %s，降级到普通生成", str(e))
+            self._circuit.record_failure()
+            return self.generate(messages, model=model)
+
+    def _run_tool_loop(self, messages: list[dict], tools: list[dict],
+                       executor: Callable[[str, dict], str],
+                       model: str, max_turns: int,
+                       max_tokens: int, temperature: float) -> str:
+        """工具调用循环：发送 → 解析 tool_calls → 执行 → 追加结果 → 继续。"""
+        msgs = list(messages)
+        api_key = settings.deepseek_api_key.get_secret_value()
+
+        for _ in range(max_turns):
+            body = self._body(msgs, model, max_tokens, temperature, tools=tools)
+            # P0-2: timeout is forwarded to _post via **kwargs
+            resp = self._retry(
+                self._post, APIPath.LLM_DEEPSEEK_CHAT.value, api_key, body,
+                timeout=self.tool_timeout,
+                max_retries=2, base_delay=0.5, max_delay=10.0)
+            self._record_tokens(resp, model)
+
+            tcs = self._parse_tool_calls(resp)
+            if not tcs:
+                return self._extract_content(resp)
+
+            msgs.append({
+                "role": "assistant",
+                "tool_calls": tcs,
+                "content": None,
+            })
+            for tc in tcs:
+                fn = tc.get("function", tc)
+                fn_name = fn.get("name", fn.get("function", {}).get("name", ""))
+                try:
+                    fn_args = json.loads(fn.get("arguments", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    fn_args = {}
+                result = executor(fn_name, fn_args)
+                msgs.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", ""),
+                    "content": result,
+                })
+
+        # 超过 max_turns，再做最后一次非工具调用
+        body = self._body(msgs, model, max_tokens, temperature)
+        resp = self._retry(
+            self._post, APIPath.LLM_DEEPSEEK_CHAT.value, api_key, body,
+            timeout=self.tool_timeout,
+            max_retries=2, base_delay=0.5, max_delay=10.0)
+        self._record_tokens(resp, model)
+        return self._extract_content(resp)
+
+    @staticmethod
+    def _parse_tool_calls(resp: dict) -> list[dict]:
+        """从 API 响应提取工具调用列表。兼容 DeepSeek/Qwen 多种格式。"""
+        msg = resp.get("choices", [{}])[0].get("message", {})
+        if not msg:
+            return []
+        tcs = msg.get("tool_calls", [])
+        if not tcs:
+            return []
+        parsed = []
+        for tc in tcs:
+            fn = tc.get("function", {})
+            parsed.append({
+                "id": tc.get("id", ""),
+                "type": tc.get("type", "function"),
+                "function": {
+                    "name": fn.get("name", ""),
+                    "arguments": fn.get("arguments", "{}"),
+                },
+            })
+        return parsed
+
+
+# ── 模块级单例 ──
+llm_client = LLMClient()
+
+=== infra/embedding/config.py ===
+"""
+嵌入模型配置。从 core.config.settings 读取，跨平台模型路径处理。
+"""
+import os
+from pathlib import Path
+
+from core.config import settings
+
+# ── 不可变常量 ──
+USE_FP16: bool = False  # CPU 环境必须关闭，PyTorch CPU 对 fp16 支持残缺
+
+
+def resolve_model_path() -> str:
+    """跨平台解析模型路径。
+
+    优先级：环境变量 BGE_MODEL_PATH > HF_HOME 缓存自动检测 > 用户默认缓存 > 回退路径。
+    支持 HuggingFace 新旧两种缓存目录格式。
+    """
+    # 1. 环境变量优先
+    env_path = os.getenv("BGE_MODEL_PATH", "")
+    if env_path and Path(env_path).exists():
+        return env_path
+
+    model_name = settings.embedding_model_name  # e.g. "BAAI/bge-m3"
+    org, name = (model_name.split("/", 1) + [""])[:2]
+
+    # 2. 自动检测 HuggingFace 缓存
+    hf_home = os.getenv("HF_HOME", str(Path.home() / ".cache" / "huggingface"))
+
+    # 新格式：~/.cache/huggingface/hub/models--{org}--{name}/snapshots/<hash>
+    snapshots_dir = Path(hf_home) / "hub" / f"models--{org}--{name}" / "snapshots"
+    if snapshots_dir.is_dir():
+        snapshots = sorted(
+            [d for d in snapshots_dir.iterdir() if d.is_dir()],
+            reverse=True,
+        )
+        if snapshots:
+            return str(snapshots[0])
+
+    # 旧格式：~/.cache/huggingface/hub/{org}/{name}
+    legacy_dir = Path(hf_home) / "hub" / model_name
+    if legacy_dir.exists():
+        return str(legacy_dir)
+
+    # 3. 默认回退路径（向后兼容）
+    return str(Path.home() / ".cache" / "huggingface" / "hub" / model_name)
+
+
+MODEL_PATH: str = resolve_model_path()
+
+=== infra/embedding/embedder.py ===
+"""
+BGE-M3 嵌入模型加载器。检索/写入独立锁，线程安全单例。
+"""
+import threading
+
+import numpy as np
+
+from core.config import settings
+from core.exceptions import InfraError
+from core.logging import get_logger
+
+from .config import MODEL_PATH, USE_FP16
+
+_logger = get_logger(__name__)
+
+_embedder: "BGEEmbedder | None" = None
+_lock = threading.RLock()
+
+
+class BGEEmbedder:
+    """BGE-M3 封装。Query/Doc 分锁，检索写入互不阻塞。"""
+
+    def __init__(self):
+        try:
+            from FlagEmbedding import FlagModel
+        except ImportError as e:
+            raise InfraError(
+                f"FlagEmbedding 未安装，无法加载 BGE-M3 模型: {e}",
+                error_code="INF_EMBED_IMPORT",
+            ) from e
+
+        _logger.info("加载嵌入模型: %s (dim=%d)", MODEL_PATH, settings.vector_dim)
+
+        try:
+            self.model = FlagModel(
+                MODEL_PATH,
+                query_instruction_for_retrieval=settings.query_instruction,
+                use_fp16=USE_FP16,
+            )
+        except Exception as e:
+            raise InfraError(
+                f"加载 BGE-M3 模型失败: {e}",
+                error_code="INF_EMBED_LOAD",
+            ) from e
+
+        self._query_lock = threading.RLock()
+        self._doc_lock = threading.RLock()
+        self.model_name = settings.embedding_model_name
+        self.vector_dim = settings.vector_dim
+
+    def encode_query(self, queries: list[str]) -> np.ndarray:
+        """编码查询向量。使用查询锁，与文档编码互不阻塞。"""
+        if not queries:
+            raise InfraError("查询列表为空", error_code="INF_EMBED_EMPTY_QUERY")
+        with self._query_lock:
+            vec = self.model.encode_queries(queries)
+            return np.ascontiguousarray(vec)
+
+    def encode_doc(self, docs: list[str]) -> np.ndarray:
+        """编码文档向量。使用文档锁，与查询编码互不阻塞。"""
+        if not docs:
+            raise InfraError("文档列表为空", error_code="INF_EMBED_EMPTY_DOC")
+        with self._doc_lock:
+            vec = self.model.encode(docs)
+            return np.ascontiguousarray(vec)
+
+
+def get_embedder() -> BGEEmbedder:
+    """获取 BGEEmbedder 单例。双重检查锁 + RLock。首次加载时预热。"""
+    global _embedder
+    if _embedder is None:
+        with _lock:
+            if _embedder is None:
+                _embedder = BGEEmbedder()
+                _warmup(_embedder)
+    return _embedder
+
+
+def _warmup(embedder: BGEEmbedder) -> None:
+    """首次加载后预热：跑一次 dummy query 触发 JIT/模型初始化。"""
+    try:
+        _logger.info("嵌入模型预热中...")
+        _ = embedder.encode_query(["预热"])
+        _logger.info("嵌入模型预热完成")
+    except Exception as e:
+        _logger.warning("嵌入模型预热失败（不影响正常使用）: %s", e)
+
+=== _env_setup.py ===
+"""
+_env_setup.py — 环境变量预植入层
+===================================
+
+**此文件必须是任何入口点（_launcher.py / main.py / cli.py）的第一个导入。**
+在 torch、numpy 等原生库被 import 之前设置线程控制环境变量，
+防止 OpenMP / BLAS / MKL 线程爆炸（尤其在 Windows 上）。
+
+约定：
+- 每个环境变量优先从 ``core.config.settings`` 读取对应属性，
+  若属性不存在或 settings 不可导入，则回退到硬编码默认值。
+- 模块被 import 时立即执行所有 os.environ 设置，无需调用任何函数。
+- 不依赖 core.config 以外的任何项目模块。
+"""
+
+import os as _os
+
+# ──────────────────────────────────────────────
+# 1. 尝试读取 settings（可选）
+# ──────────────────────────────────────────────
+_settings = None
+try:
+    from core.config import settings as _settings
+except Exception:
+    _settings = None
+
+
+def _get(key: str, default: str) -> str:
+    """从 settings 读取值，不存在则用默认值。"""
+    if _settings is not None:
+        val = getattr(_settings, key, None)
+        if val is not None:
+            return str(val)
+    return default
+
+
+# ──────────────────────────────────────────────
+# 2. 线程控制（防止 PyTorch / NumPy 线程爆炸）
+# ──────────────────────────────────────────────
+_os.environ.setdefault("OMP_NUM_THREADS", _get("omp_num_threads", "1"))
+_os.environ.setdefault("OPENBLAS_NUM_THREADS", _get("openblas_num_threads", "1"))
+_os.environ.setdefault("MKL_NUM_THREADS", _get("mkl_num_threads", "1"))
+_os.environ.setdefault("NUMEXPR_NUM_THREADS", _get("numexpr_num_threads", "1"))
+
+# ──────────────────────────────────────────────
+# 3. Windows 特定：允许重复加载 OpenMP 库
+# ──────────────────────────────────────────────
+_os.environ.setdefault("KMP_DUPLICATE_LIB_OK", _get("kmp_duplicate_lib_ok", "TRUE"))
+
+# ──────────────────────────────────────────────
+# 4. 设备控制（CPU-only）
+# ──────────────────────────────────────────────
+_os.environ.setdefault("CUDA_VISIBLE_DEVICES", _get("cuda_visible_devices", ""))
+
+# ──────────────────────────────────────────────
+# 5. Protobuf 兼容性
+# ──────────────────────────────────────────────
+_os.environ.setdefault(
+    "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION",
+    _get("protocol_buffers_python_implementation", "python"),
+)
+
+# ──────────────────────────────────────────────
+# 清理模块级临时符号，避免污染 import 方的命名空间
+# ──────────────────────────────────────────────
+del _os, _get, _settings
+
+=== _launcher.py ===
+#!/usr/bin/env python3
+"""
+白槿 v2 Unified Launcher — ALL entry points MUST route through this file.
+
+Startup sequence (in order, each step depends on the previous):
+  1. ``import _env_setup`` — environment bootstrap. Runs before any
+     other import so native libraries see the correct environment.
+  2. ``sys.path`` — ensure the project root is on the import path.
+  3. ``setup_root_logger()`` — install structured JSON log handlers.
+  4. HTTP server — ASGI lifespan manages migrations + container start/stop
+     + connection pool close. uvicorn handles signals natively.
+
+Flags:
+  --foreground-debug   Skip background-thread launch (useful for pdb/IDE
+                       debugging and single-step tracing).
+
+Environment:
+  BAIJIN_CONFIG        Path to a ``.env``-style config file.  Consumed by
+                       ``_env_setup`` before any other import — do NOT set
+                       it after the process has started.
+"""
+
+from __future__ import annotations
+
+# ═══════════════════════════════════════════════════════════════════════
+# 1. Environment bootstrap — MUST be the first executable line.
+#    _env_setup resolves BAIJIN_CONFIG, sets encoding/threading vars,
+#    and patches sys.path / os.environ before any library import sees
+#    the stale state.
+# ═══════════════════════════════════════════════════════════════════════
+import _env_setup  # noqa: E402,F401
+
+# ═══════════════════════════════════════════════════════════════════════
+# 2. Project root on sys.path (idempotent).
+# ═══════════════════════════════════════════════════════════════════════
+import sys
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Internal helpers
+# ═══════════════════════════════════════════════════════════════════════
+
+def _build_lifespan():
+    """返回 ASGI lifespan 上下文管理器，由 uvicorn 管理生命周期。
+
+    uvicorn 启动时自动安装自己的 SIGINT/SIGTERM 处理器，
+    我们必须通过 lifespan 的 startup/shutdown 钩子来执行
+    迁移、容器启停、连接池关闭，避免信号处理器被覆盖。
+    """
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def lifespan(app):
+        # ── startup ──
+        from core.logging import get_logger
+        _log = get_logger(__name__)
+        _log.info("执行数据库迁移…")
+        from infra.database import db_pool
+        from infra.database.migrations import run_migrations
+        run_migrations(db_pool)
+
+        _log.info("启动 DI 容器…")
+        from core.container import container as di_container
+        di_container.start_all()
+
+        yield  # 服务运行中
+
+        # ── shutdown ──
+        _log.info("停止 DI 容器组件…")
+        try:
+            di_container.stop_all()
+        except Exception:
+            _log.exception("DI 停止阶段异常")
+
+        _log.info("关闭数据库连接池…")
+        try:
+            db_pool.close()
+        except Exception:
+            _log.exception("数据库连接池关闭异常")
+
+    return lifespan
+
+
+def _start_http_server(debug: bool = False) -> None:
+    """Launch the HTTP server.
+
+    Prefer ``app.server.run_server()`` when the module exists (v2 target
+    architecture).  Fall back to uvicorn + ``main:app`` for backward
+    compatibility during the migration window.
+
+    生命周期通过 ASGI lifespan 管理，uvicorn 自动处理信号。
+    """
+    try:
+        import app.server  # noqa: F401
+    except ImportError:
+        app_server_available = False
+    else:
+        app_server_available = True
+
+    lifespan = _build_lifespan()
+
+    if app_server_available:
+        from app.server import run_server
+        run_server(debug=debug, lifespan=lifespan)
+    else:
+        import uvicorn
+        import asyncio
+
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+        import main as _main_module
+        old_app = _main_module.app
+
+        # 直接注入 lifespan，完全保留原应用所有能力（路由/中间件/WebSocket/SSE）
+        old_app.router.lifespan_context = lifespan
+
+        uvicorn.run(
+            old_app,
+            host="127.0.0.1",
+            port=8080,
+            log_level="debug" if debug else "info",
+            reload=False,
+            workers=1,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# main()
+# ═══════════════════════════════════════════════════════════════════════
+
+def main(*, debug: bool = False) -> None:
+    """Execute the full startup sequence.
+
+    生命周期管理：迁移 + 容器启停 + 连接池关闭 → ASGI lifespan，
+    uvicorn 统一管理信号，不单独安装信号处理器。
+
+    Parameters
+    ----------
+    debug : bool
+        When ``True``, passed to uvicorn (``--foreground-debug``).
+    """
+    # ── 3. Structured logging ──────────────────────────────────────────
+    from core.config import settings
+    from core.logging import setup_root_logger, get_logger
+
+    setup_root_logger(settings.log_level)
+    _log = get_logger(__name__)
+    _log.info(
+        "白槿 v2 启动 (debug=%s config_version=%s)",
+        debug, settings.config_version,
+    )
+
+    # ── 4. HTTP server（迁移 + 容器生命周期由 ASGI lifespan 管理）──────
+    # 注意：不在 uvicorn 之前安装信号处理器 —— uvicorn 会覆盖信号处理器，
+    # 改用 ASGI lifespan 的 startup/shutdown 钩子管理生命周期。
+    _log.info("启动 HTTP 服务器…")
+    _start_http_server(debug=debug)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# __main__ guard — Windows multiprocessing freeze support + CLI parsing
+# ═══════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import argparse
+    import multiprocessing
+
+    multiprocessing.freeze_support()
+
+    parser = argparse.ArgumentParser(
+        description="白槿 v2 unified launcher — all entry points route through here.",
+    )
+    parser.add_argument(
+        "--foreground-debug",
+        action="store_true",
+        dest="debug",
+        help="Skip background thread launch (attach pdb / IDE debugger).",
+    )
+    args = parser.parse_args()
+
+    main(debug=args.debug)
+
+=== core/config.py (LLM section) ===
+    # ── LLM 客户端参数（热更生效，infra/llm_client 读取）──
+    llm_default_timeout: float = Field(default=45.0, json_schema_extra={"hot_reload": True})
+    llm_fallback_timeout: float = Field(default=30.0, json_schema_extra={"hot_reload": True})
+    llm_tool_timeout: float = Field(default=30.0, json_schema_extra={"hot_reload": True})
+    llm_circuit_threshold: int = Field(default=3, json_schema_extra={"hot_reload": True})
+    llm_circuit_cooldown: float = Field(default=30.0, json_schema_extra={"hot_reload": True})
+    llm_retry_max: int = Field(default=3, json_schema_extra={"hot_reload": True})
+    llm_retry_base: float = Field(default=1.0, json_schema_extra={"hot_reload": True})
+    llm_retry_max_sec: float = Field(default=60.0, json_schema_extra={"hot_reload": True})
+    llm_fallback_model: str = Field(default="qwen-turbo", json_schema_extra={"hot_reload": True})
+    llm_fallback_max_tokens: int = Field(default=256, json_schema_extra={"hot_reload": True})
+    llm_fallback_temperature: float = Field(default=0.7, json_schema_extra={"hot_reload": True})
+

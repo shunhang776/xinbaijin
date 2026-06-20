@@ -1,0 +1,9 @@
+# baijin v2 memory engine deps (FAISS + BGE-M3 embedding)
+# Note: torch is ~2GB, first install may be slow
+-r core.txt
+
+faiss-cpu==1.14.2
+numpy==1.26.4
+torch==2.12.0
+opencv-python==4.13.0.92
+FlagEmbedding==1.4.0

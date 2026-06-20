@@ -1,0 +1,7 @@
+# baijin v2 HTTP server deps
+-r core.txt
+
+fastapi==0.109.0
+uvicorn==0.27.0
+httpx==0.28.1
+requests==2.34.2

@@ -1,0 +1,3 @@
+# baijin v2 all deps (including optional)
+-r base.txt
+-r optional.txt

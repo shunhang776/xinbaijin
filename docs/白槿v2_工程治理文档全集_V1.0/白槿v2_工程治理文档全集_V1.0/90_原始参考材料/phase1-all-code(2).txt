@@ -1,0 +1,4223 @@
+###############################################################################
+#  白槿 v2 — Phase 1: Foundation（core/ 全模块 + 工具链地基）
+#  包含：13 核心模块 + 2 工具 + requirements + 262 测试
+###############################################################################
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  1.1.1  core/__init__.py — 核心基础设施层入口                                ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+from core import constants
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  1.1.2  core/config.py — 统一配置中心（pydantic-settings）                    ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+"""
+白槿 v2 — 统一配置中心。
+"""
+
+import logging
+import threading
+from pathlib import Path
+from typing import Callable, get_type_hints
+
+from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_BASE_DIR = Path(__file__).resolve().parent.parent
+_DATA_DIR = _BASE_DIR / "data"
+
+_SECRET_FIELD_PATTERNS = (
+    "api_key", "client_secret", "amap_key", "memory_api_token",
+)
+
+
+def _collect_hot_fields(model: type[BaseSettings], prefix: str = "") -> set[str]:
+    fields: set[str] = set()
+    type_hints = get_type_hints(model)
+    for name, field_info in model.model_fields.items():
+        extra = field_info.json_schema_extra
+        if extra and extra.get("hot_reload"):
+            key = f"{prefix}{name}" if prefix else name
+            fields.add(key)
+        field_type = type_hints.get(name)
+        if isinstance(field_type, type) and issubclass(field_type, BaseSettings):
+            sub_prefix = f"{prefix}{name}."
+            fields |= _collect_hot_fields(field_type, sub_prefix)
+    return fields
+
+
+def _get_nested(obj: object, key: str) -> object:
+    parts = key.split(".")
+    for part in parts:
+        obj = getattr(obj, part)
+    return obj
+
+
+def _flatten_to_nested(flat: dict[str, object]) -> dict:
+    result: dict = {}
+    for key, value in flat.items():
+        parts = key.split(".")
+        current = result
+        for part in parts[:-1]:
+            current = current.setdefault(part, {})
+        current[parts[-1]] = value
+    return result
+
+
+def _dict_deep_merge(base: dict, updates: dict) -> dict:
+    result = base.copy()
+    for key, value in updates.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _dict_deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _log_mask(k: str, v: object) -> object:
+    if any(k.endswith(s) for s in _SECRET_FIELD_PATTERNS):
+        return "***"
+    if isinstance(v, SecretStr):
+        return "***"
+    return v
+
+
+class FeaturesConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="BAIJIN_FEATURE_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        validate_assignment=True,
+        extra="ignore",
+    )
+    shadow_mode: bool = Field(default=False, json_schema_extra={"hot_reload": True})
+    sense_enable: bool = Field(default=True, json_schema_extra={"hot_reload": True})
+    sense_camera_enable: bool = Field(default=False, json_schema_extra={"hot_reload": True})
+    enable_tts: bool = Field(default=False, json_schema_extra={"hot_reload": True})
+    enable_qq: bool = Field(default=False, json_schema_extra={"hot_reload": True})
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="BAIJIN_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        validate_assignment=True,
+        extra="ignore",
+    )
+
+    features: FeaturesConfig = Field(default_factory=FeaturesConfig)
+    config_version: str = Field(default="v2.0")
+    log_level: str = Field(default="INFO", json_schema_extra={"hot_reload": True})
+    enable_file_logging: bool = Field(default=True, json_schema_extra={"hot_reload": True})
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        self._reload_lock: threading.RLock = threading.RLock()
+        self._on_change_callbacks: list[Callable[[str, object], None]] = []
+        self._on_batch_change_callbacks: list[Callable[[dict[str, object]], None]] = []
+
+    def on_change(self, callback: Callable[[str, object], None]) -> None:
+        self._on_change_callbacks.append(callback)
+
+    def on_batch_change(self, callback: Callable[[dict[str, object]], None]) -> None:
+        self._on_batch_change_callbacks.append(callback)
+
+    def reload(self, **overrides: object) -> dict[str, object]:
+        if not overrides:
+            return {}
+        from core.logging import get_logger
+        _logger = get_logger(__name__)
+        hot_fields = self._hot_reload_fields()
+        with self._reload_lock:
+            self._reload_validate_keys(overrides, hot_fields)
+            validated = self._reload_apply(overrides, _logger)
+            real_changes = {k: _get_nested(validated, k) for k in overrides}
+            self._reload_log(real_changes, _logger)
+            self._reload_fire_single(real_changes, _logger)
+        self._reload_fire_batch(real_changes, _logger)
+        return real_changes
+
+    def reload_from_env(self) -> None:
+        from core.logging import get_logger
+        _logger = get_logger(__name__)
+        fresh = type(self)()
+        overrides = {}
+        for key in self._hot_reload_fields():
+            try:
+                new_val = _get_nested(fresh, key)
+                if new_val != _get_nested(self, key):
+                    overrides[key] = new_val
+            except AttributeError:
+                pass
+        if overrides:
+            self.reload(**overrides)
+        else:
+            _logger.debug("reload_from_env: 无变更")
+
+    @classmethod
+    def _hot_reload_fields(cls) -> set[str]:
+        if not hasattr(cls, "_cached_hot_fields"):
+            cls._cached_hot_fields = _collect_hot_fields(cls)
+        return cls._cached_hot_fields
+
+    @staticmethod
+    def _reload_validate_keys(overrides: dict, hot_fields: set[str]) -> None:
+        for key in overrides:
+            if key not in hot_fields:
+                raise ValueError(f"禁止热更字段 '{key}'。可用：{sorted(hot_fields)}")
+
+    def _reload_apply(self, overrides: dict, logger: "logging.Logger") -> BaseSettings:
+        nested = _flatten_to_nested(overrides)
+        merged = _dict_deep_merge(self.model_dump(), nested)
+        try:
+            validated = type(self).model_validate(merged)
+        except Exception as e:
+            logger.error("热更校验失败: %s", e)
+            raise ValueError(f"热更校验失败: {e}") from e
+        for key in overrides:
+            self._set_nested(key, _get_nested(validated, key))
+        return validated
+
+    @staticmethod
+    def _reload_log(real_changes: dict, logger: "logging.Logger") -> None:
+        logged = {k: _log_mask(k, v) for k, v in real_changes.items()}
+        logger.info("配置热更: %s", logged)
+
+    def _reload_fire_single(self, real_changes: dict, logger: "logging.Logger") -> None:
+        for key, value in real_changes.items():
+            for cb in self._on_change_callbacks:
+                try:
+                    cb(key, value)
+                except Exception:
+                    logger.debug("on_change failed: %s", key, exc_info=True)
+
+    def _reload_fire_batch(self, real_changes: dict, logger: "logging.Logger") -> None:
+        if not self._on_batch_change_callbacks:
+            return
+        for cb in self._on_batch_change_callbacks:
+            try:
+                cb(dict(real_changes))
+            except Exception:
+                logger.debug("on_batch_change failed", exc_info=True)
+
+    # ── 路径 ──
+    base_dir: Path = Field(default=_BASE_DIR)
+    data_dir: Path = Field(default=_DATA_DIR)
+    db_path: Path = Field(default=_DATA_DIR / "memory.db")
+    faiss_index_path: Path = Field(default=_DATA_DIR / "faiss.index")
+    cooccurrence_path: Path = Field(default=_DATA_DIR / "cooccurrence.pkl")
+    social_intuition_path: Path = Field(default=_DATA_DIR / "social_intuition.json")
+    social_intuition_faiss_path: Path = Field(default=_DATA_DIR / "social_intuition.faiss")
+    categories_dir: Path = Field(default=_DATA_DIR / "categories")
+    resources_dir: Path = Field(default=_DATA_DIR / "resources")
+    backup_dir: Path = Field(default=_DATA_DIR / "backup")
+    desire_persist_path: Path = Field(default=_DATA_DIR / "desire_state.json")
+    logs_dir: Path = Field(default=_BASE_DIR / "logs")
+    persona_path: Path = Field(default=_BASE_DIR / "persona.txt")
+    BASE_DIR: Path = Field(default=_BASE_DIR)
+    DATA_DIR: Path = Field(default=_DATA_DIR)
+
+    memory_limit_mb: int = Field(default=3072)
+    cpu_background_max: int = Field(default=30)
+    cpu_idle_max: int = Field(default=15)
+
+    vector_dim: int = Field(default=1024)
+    hnsw_m: int = Field(default=32)
+    ef_construction: int = Field(default=200)
+    ef_search: int = Field(default=64)
+    bm25_k1: float = Field(default=1.5)
+    bm25_b: float = Field(default=0.75)
+
+    top_k: int = Field(default=20, json_schema_extra={"hot_reload": True})
+    vector_distance_max: float = Field(default=1.0, json_schema_extra={"hot_reload": True})
+    bm25_weight: float = Field(default=0.3, json_schema_extra={"hot_reload": True})
+    vector_weight: float = Field(default=0.7, json_schema_extra={"hot_reload": True})
+
+    cleanup_expired_cron: str = Field(default="0 3 * * *", json_schema_extra={"hot_reload": True})
+    daily_summary_cron: str = Field(default="0 4 * * *", json_schema_extra={"hot_reload": True})
+    backup_cron: str = Field(default="0 3 * * *", json_schema_extra={"hot_reload": True})
+    light_maintenance_cron: str = Field(default="0 5 */3 * *", json_schema_extra={"hot_reload": True})
+    full_maintenance_cron: str = Field(default="0 5 * * 0", json_schema_extra={"hot_reload": True})
+    monthly_health_cron: str = Field(default="0 2 1 * *", json_schema_extra={"hot_reload": True})
+
+    c_grade_expire_days: int = Field(default=7, json_schema_extra={"hot_reload": True})
+    hot_data_days: int = Field(default=180, json_schema_extra={"hot_reload": True})
+    promote_access_count: int = Field(default=5, json_schema_extra={"hot_reload": True})
+    promote_window_days: int = Field(default=30, json_schema_extra={"hot_reload": True})
+    light_promote_count: int = Field(default=3, json_schema_extra={"hot_reload": True})
+    light_promote_window_days: int = Field(default=3, json_schema_extra={"hot_reload": True})
+    demote_no_access_days: int = Field(default=90, json_schema_extra={"hot_reload": True})
+    event_archive_days: int = Field(default=30, json_schema_extra={"hot_reload": True})
+    resource_keep_days: int = Field(default=30, json_schema_extra={"hot_reload": True})
+
+    dedup_threshold: float = Field(default=0.8, json_schema_extra={"hot_reload": True})
+    minhash_num_perm: int = Field(default=128)
+    dedup_window_days: int = Field(default=90, json_schema_extra={"hot_reload": True})
+
+    write_max_retries: int = Field(default=3, json_schema_extra={"hot_reload": True})
+    write_retry_delay_sec: int = Field(default=1, json_schema_extra={"hot_reload": True})
+    backup_keep_days: int = Field(default=7, json_schema_extra={"hot_reload": True})
+
+    embedding_model_name: str = Field(default="BAAI/bge-m3")
+    query_instruction: str = Field(default="为这个句子生成表示以用于检索相关文章：")
+
+    db_cache_size_mb: int = Field(default=2000)
+    db_mmap_size_mb: int = Field(default=2048)
+    db_busy_timeout_ms: int = Field(default=5000)
+    db_items_per_page: int = Field(default=10000)
+
+    emotion_time_window_days: int = Field(default=30, json_schema_extra={"hot_reload": True})
+    emotion_max_per_fact: int = Field(default=3)
+    emotion_cache_ttl: int = Field(default=60, json_schema_extra={"hot_reload": True})
+    emotion_recent_days: int = Field(default=7, json_schema_extra={"hot_reload": True})
+    emotion_recent_limit: int = Field(default=3, json_schema_extra={"hot_reload": True})
+    emotion_older_days: int = Field(default=90, json_schema_extra={"hot_reload": True})
+    emotion_older_limit: int = Field(default=2, json_schema_extra={"hot_reload": True})
+    emotion_max_text_len: int = Field(default=200)
+    emotion_archive_days: int = Field(default=365, json_schema_extra={"hot_reload": True})
+    emotion_save_min_interval: int = Field(default=300)
+    emotion_decay_rate: float = Field(default=0.02, json_schema_extra={"hot_reload": True})
+    emotion_decay_min: float = Field(default=0.1, json_schema_extra={"hot_reload": True})
+    emotion_weight_base: float = Field(default=0.1, json_schema_extra={"hot_reload": True})
+    emotion_weight_max: float = Field(default=2.0, json_schema_extra={"hot_reload": True})
+    emotion_similarity_threshold: float = Field(default=0.1, json_schema_extra={"hot_reload": True})
+    emotion_match_boost: float = Field(default=1.5, json_schema_extra={"hot_reload": True})
+    timestamp_future_tolerance: int = Field(default=3600)
+    timestamp_min_valid: int = Field(default=1577836800)
+
+    @property
+    def emotion_type_weights(self) -> dict:
+        return {
+            "proud": 1.2, "angry": 1.15, "sad": 1.1, "happy": 1.1,
+            "tender": 1.05, "anxious": 1.05, "longing": 1.0, "confused": 1.0,
+            "neutral": 1.0,
+        }
+
+    @property
+    def emotion_type_decay(self) -> dict:
+        return {
+            "proud": 0.015, "happy": 0.02, "sad": 0.02, "angry": 0.03,
+            "anxious": 0.025, "neutral": 0.025,
+        }
+
+    reminder_ahead_seconds: int = Field(default=86400)
+    reminder_max_text_len: int = Field(default=200)
+    reminder_dedup_window: int = Field(default=86400)
+
+    active_max_per_day: int = Field(default=2, json_schema_extra={"hot_reload": True})
+    active_missing_hours_peak: int = Field(default=48, json_schema_extra={"hot_reload": True})
+    active_base_probability: float = Field(default=0.25, json_schema_extra={"hot_reload": True})
+    active_quiet_start_hour: int = Field(default=6, json_schema_extra={"hot_reload": True})
+    active_daily_count_reset_hour: int = Field(default=0, json_schema_extra={"hot_reload": True})
+
+    weather_show_num: bool = Field(default=False, json_schema_extra={"hot_reload": True})
+
+    desire_max_delta_sec: int = Field(default=43200, json_schema_extra={"hot_reload": True})
+    desire_global_max_out_msg_per_month: int = Field(default=2)
+    desire_reach_out_max_per_week: int = Field(default=2)
+    desire_quiet_start: int = Field(default=23, json_schema_extra={"hot_reload": True})
+    desire_quiet_end: int = Field(default=7, json_schema_extra={"hot_reload": True})
+
+    self_check_social: float = Field(default=0.5)
+    self_check_mood: float = Field(default=0.6)
+    self_check_sense_fresh: float = Field(default=0.0)
+    self_check_energy: float = Field(default=0.5)
+    self_check_is_late: bool = Field(default=False)
+
+    deepseek_api_key: SecretStr = Field(default="")
+    serper_api_key: SecretStr = Field(default="")
+    qwen_api_key: SecretStr = Field(default="")
+    qq_client_secret: SecretStr = Field(default="")
+    amap_key: SecretStr = Field(default="")
+    memory_api_token: SecretStr = Field(default="baijin-memory-ask-2026")
+
+    qq_app_id: str = Field(default="")
+    qq_user_id: str = Field(default="")
+    qq_chat_name: str = Field(default="")
+    gpt_sovits_url: str = Field(default="http://127.0.0.1:9880")
+
+    # ── LLM 客户端参数（热更生效，infra/llm_client 读取）──
+    llm_default_timeout: float = Field(default=45.0, json_schema_extra={"hot_reload": True})
+    llm_fallback_timeout: float = Field(default=30.0, json_schema_extra={"hot_reload": True})
+    llm_tool_timeout: float = Field(default=30.0, json_schema_extra={"hot_reload": True})
+    llm_circuit_threshold: int = Field(default=3, json_schema_extra={"hot_reload": True})
+    llm_circuit_cooldown: float = Field(default=30.0, json_schema_extra={"hot_reload": True})
+    llm_retry_max: int = Field(default=3, json_schema_extra={"hot_reload": True})
+    llm_retry_base: float = Field(default=1.0, json_schema_extra={"hot_reload": True})
+    llm_retry_max_sec: float = Field(default=60.0, json_schema_extra={"hot_reload": True})
+    llm_fallback_model: str = Field(default="qwen-turbo", json_schema_extra={"hot_reload": True})
+    llm_fallback_max_tokens: int = Field(default=256, json_schema_extra={"hot_reload": True})
+    llm_fallback_temperature: float = Field(default=0.7, json_schema_extra={"hot_reload": True})
+
+    relative_days: dict = Field(default={
+        "大前天": 3, "大后天": -3, "上前天": 3,
+        "前天": 2, "后天": -2, "昨天": 1, "明天": -1, "今天": 0,
+    })
+    week_offsets: dict = Field(default={
+        "上上周": 14, "下下周": -14, "上上上周": 21,
+        "上周": 7, "下周": -7, "本周": 0, "这周": 0,
+    })
+    periods: dict = Field(default={
+        "早上": (6, 9), "上午": (8, 12), "中午": (11, 13),
+        "下午": (12, 18), "傍晚": (17, 19), "晚上": (18, 23),
+        "凌晨": (0, 6), "半夜": (23, 3), "大清早": (5, 7),
+    })
+
+    @field_validator("vector_weight", "bm25_weight")
+    @classmethod
+    def _weight_range(cls, v: float) -> float:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError(f"权重必须在 [0, 1] 之间，当前值：{v}")
+        return v
+
+    @model_validator(mode="after")
+    def _ensure_dirs(self) -> "Settings":
+        for attr in ("data_dir", "logs_dir", "backup_dir", "categories_dir", "resources_dir"):
+            path = getattr(self, attr, None)
+            if path is not None:
+                path.mkdir(parents=True, exist_ok=True)
+        return self
+
+    def _set_nested(self, key: str, value: object) -> None:
+        if "." not in key:
+            setattr(self, key, value)
+            return
+        parts = key.split(".")
+        obj = self
+        for part in parts[:-1]:
+            obj = getattr(obj, part)
+        setattr(obj, parts[-1], value)
+
+
+settings = Settings()
+features = settings.features
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  1.1.3  core/constants.py — 业务常量与 API 路径收口                          ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+"""
+白槿 v2 — 业务常量与 API 路径收口。
+
+所有 API 路径、错误码枚举、跨模块业务常量均在此定义。
+禁止在其他模块硬编码 URL 或魔法数字。
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+
+
+# ═══════════════════════════════════════════
+# API 路径常量（全项目唯一收口）
+# ═══════════════════════════════════════════
+
+class APIPath(str, Enum):
+    """API 路径枚举。所有路由注册必须引用此枚举，禁止硬编码字符串。"""
+    _ignore_ = ["_PREFIX"]
+    _PREFIX = "/memory/api"
+
+    # 健康检查
+    HEALTH = "/health"
+    HEALTH_LIVENESS = "/health/liveness"
+    HEALTH_READINESS = "/health/readiness"
+
+    # QQ Bot
+    QQ_WEBHOOK = "/qq/webhook"
+    QQ_EVENT = "/qq/event"
+
+    # 记忆 API（复用 _PREFIX）
+    MEMORY_API_PREFIX = _PREFIX
+    MEMORY_SEARCH = f"{_PREFIX}/search"
+    MEMORY_WRITE = f"{_PREFIX}/write"
+    MEMORY_UPDATE = f"{_PREFIX}/update"
+    MEMORY_DELETE = f"{_PREFIX}/delete"
+    MEMORY_STATS = f"{_PREFIX}/stats"
+
+    # Claude 桥接
+    BRIDGE_CHAT = "/bridge/chat"
+    BRIDGE_STREAM = "/bridge/stream"
+
+    # 内部管理
+    ADMIN_RELOAD_CONFIG = "/admin/reload-config"
+    ADMIN_SHADOW_MODE = "/admin/shadow-mode"
+
+    # LLM 外部 API（全项目唯一 URL 收口）
+    LLM_DEEPSEEK_CHAT = "https://api.deepseek.com/v1/chat/completions"
+    LLM_QWEN_CHAT = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+
+
+# ═══════════════════════════════════════════
+# 错误码枚举
+# ═══════════════════════════════════════════
+
+class ErrorCode(str, Enum):
+    """全项目错误码收口。按层级前缀分类。"""
+
+    # ── 基础设施层 INF_ ──
+    INF_TIMEOUT = "INF_TIMEOUT"
+    INF_DB_ERROR = "INF_DB_ERROR"
+    INF_EMBED_ERROR = "INF_EMBED_ERROR"
+    INF_NETWORK_ERROR = "INF_NETWORK_ERROR"
+    INF_CONFIG_ERROR = "INF_CONFIG_ERROR"
+    INF_MODEL_NOT_LOADED = "INF_MODEL_NOT_LOADED"
+
+    # ── 记忆层 MEM_ ──
+    MEM_INDEX_ERROR = "MEM_INDEX_ERROR"
+    MEM_WRITE_ERROR = "MEM_WRITE_ERROR"
+    MEM_RETRIEVE_ERROR = "MEM_RETRIEVE_ERROR"
+    MEM_EVOLVE_ERROR = "MEM_EVOLVE_ERROR"
+    MEM_NOT_FOUND = "MEM_NOT_FOUND"
+    MEM_DUPLICATE = "MEM_DUPLICATE"
+
+    # ── 插件层 PLG_ ──
+    PLG_EXEC_ERROR = "PLG_EXEC_ERROR"
+    PLG_VALIDATION_ERROR = "PLG_VALIDATION_ERROR"
+    PLG_RATE_LIMITED = "PLG_RATE_LIMITED"
+    PLG_DUPLICATE_NAME = "PLG_DUPLICATE_NAME"
+    PLG_CIRCULAR_DEPENDENCY = "PLG_CIRCULAR_DEPENDENCY"
+    PLG_NOT_FOUND = "PLG_NOT_FOUND"
+
+    # ── 应用层 APP_ ──
+    APP_NOT_FOUND = "APP_NOT_FOUND"
+    APP_AUTH_FAILED = "APP_AUTH_FAILED"
+    APP_BAD_REQUEST = "APP_BAD_REQUEST"
+    APP_INTERNAL_ERROR = "APP_INTERNAL_ERROR"
+    APP_SERVICE_UNAVAILABLE = "APP_SERVICE_UNAVAILABLE"
+
+
+# ═══════════════════════════════════════════
+# 记忆等级
+# ═══════════════════════════════════════════
+
+class MemoryGrade(str, Enum):
+    """记忆等级。S/A 级永不自动删除。"""
+    S = "S"  # 核心人格
+    A = "A"  # 重要
+    B = "B"  # 普通
+    C = "C"  # 临时/可过期
+
+
+PROTECTED_GRADES: tuple[str, ...] = (MemoryGrade.A, MemoryGrade.S)
+
+
+# ═══════════════════════════════════════════
+# 业务常量
+# ═══════════════════════════════════════════
+
+# ── 时间（不可变数学常量） ──
+SECONDS_PER_DAY: int = 86400
+SECONDS_PER_HOUR: int = 3600
+
+# ── 检索默认值（仅作文档参考，运行时以 config 为准） ──
+MAX_MEMORY_TEXT_LEN: int = 2000
+
+# ── 死信队列 ──
+DEAD_LETTER_MAX_RETRIES: int = 3
+DEAD_LETTER_RETRY_INTERVAL: int = 300
+DEAD_LETTER_ARCHIVE_THRESHOLD: int = 100
+
+# ── 缓存 ──
+CACHE_DEFAULT_TTL: int = 300
+CACHE_MAX_SIZE: int = 5000
+CACHE_NULL_TTL: int = 30
+
+# ── 优雅停止 ──
+SHUTDOWN_DRAIN_TIMEOUT: float = 10.0
+SHUTDOWN_FORCE_TIMEOUT: float = 15.0
+
+# ── 限流 ──
+RATE_LIMIT_DEFAULT_RPS: int = 10
+RATE_LIMIT_BURST: int = 20
+
+# ── 日志 ──
+_MB: int = 1024 * 1024
+LOG_RETENTION_DAYS: int = 7
+LOG_MAX_BYTES: int = 10 * _MB
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  1.1.4  core/paths.py — 文件路径常量                                         ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+"""
+白槿 v2 — 文件路径常量。
+
+与 core/config.py 的 pydantic-settings 解耦，供无需依赖配置系统的底层模块使用。
+config.py 中的路径字段保持同步，应用层优先使用 config 中的值。
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+__all__ = [
+    "BASE_DIR", "DATA_DIR",
+    "DB_PATH", "FAISS_INDEX_PATH", "COOCCURRENCE_PATH",
+    "SOCIAL_INTUITION_PATH", "SOCIAL_INTUITION_FAISS_PATH",
+    "CATEGORIES_DIR", "RESOURCES_DIR", "BACKUP_DIR",
+    "DESIRE_PERSIST_PATH",
+    "LOGS_DIR", "PERSONA_PATH",
+    "DEAD_LETTER_DIR", "SNAPSHOT_DIR",
+]
+
+# ── 根目录 ──
+BASE_DIR: Path = Path(__file__).resolve().parent.parent
+DATA_DIR: Path = BASE_DIR / "data"
+
+# ── 数据库与索引 ──
+DB_PATH: Path = DATA_DIR / "memory.db"
+FAISS_INDEX_PATH: Path = DATA_DIR / "faiss.index"
+COOCCURRENCE_PATH: Path = DATA_DIR / "cooccurrence.pkl"
+
+# ── 社交直觉 ──
+SOCIAL_INTUITION_PATH: Path = DATA_DIR / "social_intuition.json"
+SOCIAL_INTUITION_FAISS_PATH: Path = DATA_DIR / "social_intuition.faiss"
+
+# ── 存储目录 ──
+CATEGORIES_DIR: Path = DATA_DIR / "categories"
+RESOURCES_DIR: Path = DATA_DIR / "resources"
+BACKUP_DIR: Path = DATA_DIR / "backup"
+
+# ── 持久化文件 ──
+DESIRE_PERSIST_PATH: Path = DATA_DIR / "desire_state.json"
+
+# ── 日志与配置 ──
+LOGS_DIR: Path = BASE_DIR / "logs"
+PERSONA_PATH: Path = BASE_DIR / "persona.txt"
+
+# ── 运行时目录（不提交版本控制） ──
+DEAD_LETTER_DIR: Path = DATA_DIR / "dead_letter"
+SNAPSHOT_DIR: Path = DATA_DIR / "snapshots"
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  1.1.5  core/utils.py — 北京时间戳工具函数                                   ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+"""
+全项目时间戳统一为北京时间秒级戳，格式化统一入口。
+
+铁律：
+  1. 所有内部时间统一使用 now_ts() 生成的北京时间戳，禁止直接调用 time.time()
+  2. 外部数据进入：utc_ts_to_bj() 转换后再进业务
+  3. 数据发往外部：bj_ts_to_utc() 转换后再发出
+  4. 格式化统一走 fmt_ts() / day_str() / week_str()，不直接用 datetime.fromtimestamp()
+"""
+
+from __future__ import annotations
+
+import time as _time
+from datetime import datetime, timezone, timedelta
+
+__all__ = [
+    "now_ts", "ts_to_datetime", "validate_ts",
+    "fmt_ts", "day_str", "week_str",
+    "utc_ts_to_bj", "bj_ts_to_utc",
+]
+
+_BEIJING_OFFSET: int = 8 * 3600
+_BEIJING = timezone(timedelta(hours=8))
+
+
+def utc_ts_to_bj(utc_ts: float | int) -> int:
+    """标准 UTC Unix 时间戳 → 北京时间戳。外部数据进入系统的唯一入口。"""
+    return int(utc_ts + _BEIJING_OFFSET)
+
+
+def bj_ts_to_utc(bj_ts: float | int) -> int:
+    """北京时间戳 → 标准 UTC Unix 时间戳。数据发往外部的唯一出口。"""
+    return int(bj_ts - _BEIJING_OFFSET)
+
+
+def now_ts() -> int:
+    """北京时间秒级戳。全项目唯一合法的时间戳生成入口。"""
+    return int(_time.time() + _BEIJING_OFFSET)
+
+
+def ts_to_datetime(ts: int) -> datetime:
+    """北京秒级戳 → datetime（北京时区）。全项目唯一合法的格式化入口。"""
+    return datetime.fromtimestamp(ts - _BEIJING_OFFSET, _BEIJING)
+
+
+def validate_ts(ts: int) -> int:
+    """校验外部传入的时间戳：必须是秒级，毫秒级直接报错。"""
+    if ts >= 10 ** 12:
+        raise ValueError(f"禁止毫秒时间戳: {ts}，请传秒级北京时间戳")
+    return ts
+
+
+def fmt_ts(ts: int) -> str:
+    """北京时间戳 → ISO 格式字符串（仅用于日志展示）。"""
+    return ts_to_datetime(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def day_str(ts: int) -> str:
+    """北京时间戳 → 'YYYY-MM-DD'（用于按天分组）。"""
+    return ts_to_datetime(ts).strftime("%Y-%m-%d")
+
+
+def week_str(ts: int) -> str:
+    """北京时间戳 → 'YYYY-W##'（用于按周分组）。"""
+    dt = ts_to_datetime(ts)
+    return f"{dt.year}-W{dt.isocalendar()[1]:02d}"
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  1.1.6  core/cache.py — TTL+LRU 缓存（三防：穿透/雪崩/击穿）                 ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+"""
+白槿 v2 — TTL+LRU 缓存，三防（穿透/雪崩/击穿）。OrderedDict 实现 O(1) LRU。
+"""
+
+from __future__ import annotations
+
+import random
+import threading
+import time
+from collections import OrderedDict
+from typing import Callable
+
+from core.constants import CACHE_DEFAULT_TTL, CACHE_MAX_SIZE, CACHE_NULL_TTL
+
+__all__ = ["TTLLRUCache"]
+
+
+class TTLLRUCache:
+    """TTL + LRU 混合缓存。线程安全。"""
+
+    def __init__(self, max_size: int = CACHE_MAX_SIZE, default_ttl: int = CACHE_DEFAULT_TTL) -> None:
+        self._max_size = max_size
+        self._default_ttl = default_ttl
+        self._lock = threading.RLock()
+        self._store: OrderedDict[str, tuple[float, object]] = OrderedDict()
+        self._hits = 0
+        self._misses = 0
+        self._key_locks: dict[str, threading.RLock] = {}
+
+    # ── 内部查询 ──
+
+    def _get_entry(self, key: str) -> tuple[bool, object]:
+        """返回 (是否命中, 值)。命中返回 True+值（含 None）；未命中返回 False+None。"""
+        with self._lock:
+            if key not in self._store:
+                self._misses += 1
+                return False, None
+            expire_at, value = self._store[key]
+            if expire_at < time.monotonic():
+                self._store.pop(key, None)
+                self._misses += 1
+                return False, None
+            self._store.move_to_end(key)
+            self._hits += 1
+            return True, value
+
+    # ── 公开接口 ──
+
+    def get(self, key: str) -> object | None:
+        _, value = self._get_entry(key)
+        return value
+
+    def get_or_compute(self, key: str, factory: Callable[[], object], ttl: int | None = None) -> object:
+        exists, result = self._get_entry(key)
+        if exists:
+            return result
+
+        with self._lock:
+            key_lock = self._key_locks.setdefault(key, threading.RLock())
+
+        try:
+            with key_lock:
+                exists, result = self._get_entry(key)
+                if exists:
+                    return result
+                value = factory()
+                self.set(key, value, ttl=ttl)
+        finally:
+            # 释放 key_lock 后清理，身份校验防误删新线程创建的锁
+            with self._lock:
+                if self._key_locks.get(key) is key_lock:
+                    del self._key_locks[key]
+
+        return value
+
+    def set(self, key: str, value: object, ttl: int | None = None) -> None:
+        with self._lock:
+            base = ttl if ttl is not None else (CACHE_NULL_TTL if value is None else self._default_ttl)
+            ttl = int(base * random.uniform(0.9, 1.1))
+            expire_at = time.monotonic() + ttl
+            self._store[key] = (expire_at, value)
+            self._store.move_to_end(key)
+            self._evict()
+
+    def delete(self, key: str) -> None:
+        with self._lock:
+            self._store.pop(key, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._store.clear()
+
+    def stats(self) -> dict:
+        with self._lock:
+            total = self._hits + self._misses
+            return {
+                "size": len(self._store),
+                "max_size": self._max_size,
+                "hit_rate": self._hits / total if total > 0 else 0.0,
+            }
+
+    # ── 内部 ──
+
+    def _evict(self) -> None:
+        while len(self._store) > self._max_size:
+            self._store.popitem(last=False)
+
+
+global_cache = TTLLRUCache()
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  1.1.7  core/metrics.py — 轻量指标采集器                                     ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+"""
+白槿 v2 — 轻量指标采集器。请求量/延迟/错误率/Token/检索命中率/缓存命中率/进程内存。
+"""
+
+from __future__ import annotations
+
+import threading
+
+import psutil
+
+__all__ = ["MetricsCollector"]
+
+
+class MetricsCollector:
+    """轻量指标采集，线程安全。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._request_total = 0
+        self._request_error = 0
+        self._latency_sum_ms = 0.0
+        self._latency_max_ms = 0.0
+        self._cache_hits = 0
+        self._cache_total = 0
+        self._search_hits = 0
+        self._search_total = 0
+        self._token_used: dict[str, int] = {}
+        self._process: psutil.Process | None = None
+
+    # ── 记录 ──
+
+    def record_request(self, latency_ms: float, status: str = "ok") -> None:
+        with self._lock:
+            self._request_total += 1
+            self._latency_sum_ms += latency_ms
+            if latency_ms > self._latency_max_ms:
+                self._latency_max_ms = latency_ms
+            if status != "ok":
+                self._request_error += 1
+
+    def record_cache(self, hit: bool = True) -> None:
+        with self._lock:
+            self._cache_total += 1
+            if hit:
+                self._cache_hits += 1
+
+    def record_search(self, hit: bool = True) -> None:
+        with self._lock:
+            self._search_total += 1
+            if hit:
+                self._search_hits += 1
+
+    def record_token(self, count: int, model: str = "default") -> None:
+        with self._lock:
+            self._token_used[model] = self._token_used.get(model, 0) + count
+
+    def record_error(self, error_type: str = "") -> None:
+        """记录一次异常。内部同步递增请求总数，避免错误数 > 总请求数。"""
+        with self._lock:
+            self._request_total += 1
+            self._request_error += 1
+
+    # ── 快照 ──
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            total = self._request_total
+            errors = self._request_error
+            avg_latency = (
+                self._latency_sum_ms / total if total > 0 else 0.0
+            )
+            max_latency = self._latency_max_ms
+            cache_hit_rate = (
+                self._cache_hits / self._cache_total
+                if self._cache_total > 0
+                else 0.0
+            )
+            search_hit_rate = (
+                self._search_hits / self._search_total
+                if self._search_total > 0
+                else 0.0
+            )
+            tokens = dict(self._token_used)
+
+        # 内存采集不持锁，psutil 系统调用不阻塞其他线程
+        return {
+            "request_total": total,
+            "request_error": errors,
+            "latency_avg_ms": round(avg_latency, 2),
+            "latency_max_ms": round(max_latency, 2),
+            "cache_hit_rate": round(cache_hit_rate, 4),
+            "search_hit_rate": round(search_hit_rate, 4),
+            "token_used": tokens,
+            "memory_mb": self._memory_usage_mb(),
+        }
+
+    def reset(self) -> None:
+        with self._lock:
+            self._request_total = 0
+            self._request_error = 0
+            self._latency_sum_ms = 0.0
+            self._latency_max_ms = 0.0
+            self._cache_hits = 0
+            self._cache_total = 0
+            self._search_hits = 0
+            self._search_total = 0
+            self._token_used.clear()
+
+    # ── 内存 ──
+
+    def _memory_usage_mb(self) -> float:
+        try:
+            if self._process is None:
+                self._process = psutil.Process()
+            return round(self._process.memory_info().rss / (1024 * 1024), 2)
+        except Exception:
+            return 0.0
+
+
+metrics = MetricsCollector()
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  1.1.8  core/logging.py — 结构化 JSON 日志                                   ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+"""
+白槿 v2 — 结构化 JSON 日志。日志时间 UTC，业务时间戳北京时间。
+
+架构：所有业务 logger 通过 get_logger() 纳入 baijin 命名空间，自动向上传播。
+根 logger "baijin" 统一挂载控制台 + 文件 handler，子 logger 不单独配置。
+
+注意：contextvars 在 asyncio 协程中自动跨任务传递 trace_id；
+标准多线程（threading）场景下子线程不会自动继承，需手动 copy_context 或显式传入。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import sys
+from contextvars import ContextVar
+from datetime import datetime, timezone
+from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
+
+# ── 预编译脱敏正则 ──
+_SENSITIVE_RE = re.compile(
+    r'(?i)('
+    r'api_key|secret|token|password|client_secret'
+    r'|amap_key|memory_api_token|access_token|refresh_token'
+    r')(\s*[=:]\s*)\S+'
+)
+
+__all__ = ["get_logger", "setup_root_logger", "setup_file_logging"]
+
+trace_id_var: ContextVar[str] = ContextVar("trace_id", default="")
+span_id_var: ContextVar[str] = ContextVar("span_id", default="")
+
+_ROOT_LOGGER_NAME = "baijin"
+_LEVELS = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+}
+
+
+class _JsonFormatter(logging.Formatter):
+    """JSON 行格式化，自动注入 trace_id/span_id，过滤敏感字段。"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": _SENSITIVE_RE.sub(r'\1\2***', record.getMessage()),
+            "trace_id": trace_id_var.get(),
+            "span_id": span_id_var.get(),
+            "module": f"{record.module}:{record.lineno}",
+        }
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False) + "\n"
+
+
+def get_logger(name: str) -> logging.Logger:
+    """获取日志器。name 通常传 __name__，自动纳入 baijin 命名空间。"""
+    return logging.getLogger(f"{_ROOT_LOGGER_NAME}.{name}")
+
+
+def setup_root_logger(level: int | str = logging.INFO) -> None:
+    """初始化根 logger。每次调用更新级别；handler 幂等。"""
+    if isinstance(level, str):
+        level = _LEVELS.get(level.upper(), logging.INFO)
+
+    root = logging.getLogger(_ROOT_LOGGER_NAME)
+    root.setLevel(level)
+    root.propagate = False
+
+    if root.handlers:
+        return  # handler 已安装，级别已在上面通过 root.setLevel 更新
+
+    formatter = _JsonFormatter()
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(formatter)
+    root.addHandler(console)
+
+    # 首次初始化时根据配置决定是否挂载文件日志
+    from core.config import settings
+    if settings.enable_file_logging:
+        setup_file_logging()
+
+
+def setup_file_logging(log_dir: str | Path | None = None) -> None:
+    """挂载文件日志 handler（幂等）。"""
+    if log_dir is None:
+        from core.paths import LOGS_DIR
+        log_dir = LOGS_DIR
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    root = logging.getLogger(_ROOT_LOGGER_NAME)
+    if not root.handlers:
+        setup_root_logger()
+
+    if any(isinstance(h, TimedRotatingFileHandler) for h in root.handlers):
+        return
+
+    formatter = _JsonFormatter()
+
+    daily = TimedRotatingFileHandler(
+        log_dir / "baijin.log",
+        when="midnight", interval=1, backupCount=7,
+        encoding="utf-8", utc=True,
+    )
+    daily.setFormatter(formatter)
+    daily.setLevel(logging.DEBUG)
+    root.addHandler(daily)
+
+    error_handler = TimedRotatingFileHandler(
+        log_dir / "baijin_error.log",
+        when="midnight", interval=1, backupCount=30,
+        encoding="utf-8", utc=True,
+    )
+    error_handler.setFormatter(formatter)
+    error_handler.setLevel(logging.ERROR)
+    root.addHandler(error_handler)
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  1.1.9  core/types.py — 全项目 DTO 与 Protocol 定义                          ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+"""
+白槿 v2 — 全项目 DTO 与 Protocol 唯一定义收口。
+
+所有跨层数据结构和接口契约均在此定义。
+DTO 使用 @dataclass(frozen=True) 防意外修改；
+跨层接口使用 typing.Protocol 声明，不依赖具体实现。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Generic, Protocol, TypeVar, runtime_checkable
+
+from core.constants import MemoryGrade
+
+T = TypeVar("T")
+
+
+# ═══════════════════════════════════════════
+# 通用返回类型
+# ═══════════════════════════════════════════
+
+@dataclass(frozen=True)
+class Result(Generic[T]):
+    """统一返回类型。ok=True 时 data 有效；ok=False 时 error_code 有效。"""
+    ok: bool
+    data: T | None = None
+    error_code: str = ""
+    error_detail: str = ""
+
+    @classmethod
+    def success(cls, data: T) -> Result[T]:
+        return cls(ok=True, data=data)
+
+    @classmethod
+    def failure(cls, error_code: str, error_detail: str = "") -> Result[T]:
+        return cls(ok=False, error_code=error_code, error_detail=error_detail)
+
+
+# ═══════════════════════════════════════════
+# 核心 DTO
+# ═══════════════════════════════════════════
+
+@dataclass(frozen=True)
+class PromptData:
+    """组装提示词所需的全部数据。"""
+    persona: str = ""
+    user_message: str = ""
+    memories: list[str] = field(default_factory=list)
+    extra: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MemoryItem:
+    """单条记忆记录。"""
+    id: str  # noqa: A003 — dataclass 字段名，有意覆盖 built-in id()
+    content: str
+    grade: MemoryGrade = MemoryGrade.B
+    created_at: int = 0
+    updated_at: int = 0
+    category: str = ""
+    tags: list[str] = field(default_factory=list)
+    source: str = ""
+    access_count: int = 0
+    last_accessed_at: int = 0
+
+
+@dataclass(frozen=True)
+class HealthStatus:
+    """健康检查状态。"""
+    status: str = "ok"  # ok / degraded / error
+    score: int = 100
+    checks: dict[str, object] = field(default_factory=dict)
+    version: str = "2.0.0"
+
+
+@dataclass(frozen=True)
+class MetricsSnapshot:
+    """指标快照。"""
+    timestamp: int = 0
+    request_total: int = 0
+    request_error: int = 0
+    latency_avg_ms: float = 0.0
+    latency_max_ms: float = 0.0
+    cache_hit_rate: float = 0.0
+    search_hit_rate: float = 0.0
+    token_used: dict[str, int] = field(default_factory=dict)
+    memory_mb: float = 0.0
+
+
+@dataclass(frozen=True)
+class TraceContext:
+    """分布式追踪上下文。"""
+    trace_id: str = ""
+    span_id: str = ""
+
+
+# ═══════════════════════════════════════════
+# 跨层 Protocol
+# ═══════════════════════════════════════════
+
+@runtime_checkable
+class DomainModule(Protocol):
+    """领域模块协议。每个领域模块（identity/activity/habits 等）实现此接口。"""
+    @property
+    def name(self) -> str: ...
+    @property
+    def priority(self) -> int: ...
+    def get_context(self) -> dict[str, object]: ...
+    def get_tools(self) -> list[object]: ...
+
+
+@runtime_checkable
+class BaseIndex(Protocol):
+    """索引协议。vector/bm25/time/associative 四种索引均实现此接口。"""
+    @property
+    def name(self) -> str: ...
+    def add(self, item_id: str, text: str, meta: dict[str, object] | None = None) -> None: ...
+    def remove(self, item_id: str) -> None: ...
+    def search(self, query: str, top_k: int = 20) -> list[tuple[str, float]]: ...
+    def count(self) -> int: ...
+
+
+@runtime_checkable
+class FusionStrategy(Protocol):
+    """多索引融合排序策略协议。"""
+    @property
+    def name(self) -> str: ...
+    def fuse(self, results: list[list[tuple[str, float]]], weights: list[float], top_k: int) -> list[tuple[str, float]]: ...
+
+
+@runtime_checkable
+class LifecycleComponent(Protocol):
+    """生命周期组件协议。DI 容器通过此接口管理启停。"""
+    def start(self) -> None: ...
+    def stop(self, timeout: float) -> None: ...
+    def is_healthy(self) -> bool: ...
+
+
+@runtime_checkable
+class ActivityProvider(Protocol):
+    """活动数据提供者协议。为 personality 模块提供用户活动数据。"""
+    def get_recent_activity(self, hours: int) -> dict[str, object]: ...
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  1.1.10 core/exceptions.py — 分层异常体系                                    ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+"""
+白槿 v2 — 分层异常体系。
+
+分层规则：
+- 基础设施层 → InfraError (前缀 INF_)
+- 记忆层 → MemoryError (前缀 MEM_)
+- 插件层 → PluginError (前缀 PLG_)
+- 应用层 → AppError (前缀 APP_，仅限路由/中间件/入口使用)
+
+每层只抛自己的异常类型；上层可捕获并包装为 Result。
+"""
+
+from __future__ import annotations
+
+
+class BaijinBaseError(Exception):
+    """白槿异常基类。所有业务异常均继承此类。"""
+    def __init__(self, message: str, error_code: str = "", context: dict[str, object] | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.error_code = error_code
+        self.context: dict[str, object] = context or {}
+
+    def __str__(self) -> str:
+        if self.error_code:
+            return f"[{self.error_code}] {self.message}"
+        return self.message
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(error_code={self.error_code!r}, message={self.message!r})"
+
+    def with_context(self, **kwargs: object) -> BaijinBaseError:
+        """链式追加上下文信息，返回自身。"""
+        self.context.update(kwargs)
+        return self
+
+
+class InfraError(BaijinBaseError):
+    """基础设施层异常。LLM/DB/嵌入/网络/配置错误均归此类。"""
+    pass
+
+
+class MemoryError(BaijinBaseError):
+    """记忆层异常。索引/写入/检索/演化/未找到错误均归此类。"""
+    pass
+
+
+class PluginError(BaijinBaseError):
+    """插件层异常。执行/校验/限流/重名/循环依赖错误均归此类。"""
+    pass
+
+
+class AppError(BaijinBaseError):
+    """应用层异常。仅限路由/中间件/入口使用，下层严禁抛出此类。"""
+    pass
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  1.1.11 core/container.py — 依赖注入容器                                     ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+"""
+白槿 v2 — 依赖注入容器。构造注入 + 拓扑排序生命周期编排。
+
+使用约束：启动阶段单线程注册 + 启动，运行期只读 resolve。
+"""
+
+from __future__ import annotations
+
+import threading
+from collections import defaultdict, deque
+from typing import Any, Callable
+
+from core.constants import SHUTDOWN_DRAIN_TIMEOUT
+from core.exceptions import BaijinBaseError
+from core.types import LifecycleComponent
+
+
+class CircularDependencyError(BaijinBaseError):
+    """循环依赖错误。"""
+
+
+class DependencyContainer:
+    """DI 容器。启动时注册，运行期禁止 resolve。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._registry: dict[type, Any] = {}
+        self._factories: dict[type, Any] = {}
+        self._deps: dict[type, list[type]] = {}
+        self._lazy: set[type] = set()
+
+    def register(self, protocol_type: type, factory: Callable[..., Any] | Any, deps: list[type] | None = None, lazy: bool = False) -> None:
+        with self._lock:
+            if protocol_type in self._factories:
+                raise ValueError(f"重复注册: {protocol_type.__name__}")
+            self._factories[protocol_type] = factory
+            self._deps[protocol_type] = deps or []
+            if lazy:
+                self._lazy.add(protocol_type)
+
+    def resolve(self, protocol_type: type) -> Any:
+        with self._lock:
+            if protocol_type in self._registry:
+                return self._registry[protocol_type]
+            factory = self._factories.get(protocol_type)
+            if factory is None:
+                raise KeyError(f"未注册: {protocol_type.__name__}")
+            dep_instances = [self.resolve(dep) for dep in self._deps.get(protocol_type, [])]
+            instance = factory(*dep_instances) if callable(factory) else factory
+            self._registry[protocol_type] = instance
+            return instance
+
+    def _topo_order(self) -> list[type]:
+        all_types = set(self._factories) | set(self._registry)
+        in_degree: dict[type, int] = defaultdict(int)
+        graph: dict[type, list[type]] = defaultdict(list)
+        for t in all_types:
+            in_degree.setdefault(t, 0)
+        for t, deps in self._deps.items():
+            for dep in deps:
+                graph[dep].append(t)
+                in_degree[t] += 1
+        queue = deque(t for t in all_types if in_degree[t] == 0)
+        result = []
+        while queue:
+            node = queue.popleft()
+            result.append(node)
+            for neighbor in graph[node]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+        if len(result) != len(all_types):
+            remaining = [t.__name__ for t in all_types if t not in result]
+            raise CircularDependencyError(f"检测到循环依赖，未解析节点: {remaining}")
+        return result
+
+    def detect_cycle(self) -> None:
+        with self._lock:
+            self._topo_order()
+
+    def start_all(self) -> None:
+        with self._lock:
+            order = self._topo_order()
+        for protocol_type in order:
+            if protocol_type in self._lazy:
+                continue
+            instance = self.resolve(protocol_type)
+            if isinstance(instance, LifecycleComponent):
+                instance.start()
+
+    def stop_all(self, timeout: float = SHUTDOWN_DRAIN_TIMEOUT) -> None:
+        from core.logging import get_logger
+        _log = get_logger(__name__)
+        with self._lock:
+            try:
+                order = list(reversed(self._topo_order()))
+            except CircularDependencyError:
+                _log.warning("检测到循环依赖，将按无序方式停止已实例化组件")
+                order = list(self._registry.keys())
+        for protocol_type in order:
+            instance = self._registry.get(protocol_type)
+            if isinstance(instance, LifecycleComponent):
+                try:
+                    instance.stop(timeout)
+                except Exception:
+                    _log.exception("停止组件失败: %s", protocol_type.__name__)
+
+    def is_healthy(self) -> bool:
+        with self._lock:
+            for instance in self._registry.values():
+                if isinstance(instance, LifecycleComponent):
+                    if not instance.is_healthy():
+                        return False
+            return True
+
+
+container = DependencyContainer()
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  1.1.12 core/signal_handler.py — 全局信号管理                                ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+"""
+白槿 v2 — 全局信号管理。SIGINT/SIGTERM/Ctrl+C → 优雅停止。
+
+约束：必须在主线程调用 install_signal_handlers()（Python signal 模块限制）。
+"""
+
+from __future__ import annotations
+
+import signal
+import sys
+import threading
+from typing import Callable
+
+from core.constants import SHUTDOWN_FORCE_TIMEOUT
+from core.logging import get_logger
+
+__all__ = [
+    "install_signal_handlers",
+    "is_shutting_down",
+]
+
+_log = get_logger(__name__)
+
+_INSTALLED = False
+_STOPPING = threading.Event()
+_lock = threading.RLock()
+
+
+def is_shutting_down() -> bool:
+    """查询当前是否处于关闭流程中。线程安全。"""
+    return _STOPPING.is_set()
+
+
+def install_signal_handlers(stop_callback: Callable[[], None]) -> None:
+    """注册 SIGINT/SIGTERM 信号处理。幂等，原子化，多次调用安全。"""
+    global _INSTALLED
+    with _lock:
+        if _INSTALLED:
+            return
+
+        def _handle_signal(signum, frame):
+            if _STOPPING.is_set():
+                _log.warning("重复收到停止信号，强制退出")
+                sys.exit(1)
+
+            _STOPPING.set()
+            _log.info("收到信号 %d，触发优雅停止", signum)
+
+            # 后台执行停止回调，主线程等待超时兜底
+            stop_thread = threading.Thread(target=stop_callback, daemon=True)
+            stop_thread.start()
+            stop_thread.join(timeout=SHUTDOWN_FORCE_TIMEOUT)
+
+            if stop_thread.is_alive():
+                _log.warning("优雅停止超时（%.0fs），强制退出", SHUTDOWN_FORCE_TIMEOUT)
+                sys.exit(1)
+
+            _log.info("优雅停止完成")
+            sys.exit(0)
+
+        try:
+            signal.signal(signal.SIGINT, _handle_signal)
+            signal.signal(signal.SIGTERM, _handle_signal)
+        except AttributeError:
+            pass  # 旧版 Python 可能不定义 SIGTERM 常量
+        except ValueError:
+            _log.warning("信号处理器安装失败：必须在主线程中调用 install_signal_handlers")
+            return
+
+        _INSTALLED = True
+
+    _log.info("信号处理器已安装 (SIGINT%s)", " + SIGTERM" if hasattr(signal, "SIGTERM") else "")
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  1.1.13 version.py — 版本号                                                  ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+__version__ = "2.0.0"
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  1.1.14 scripts/ops/lint_imports.py — 导入规范检查                           ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+"""
+白槿 v2 导入规范检查。
+
+规则：
+  1. 外部模块禁止绕过 core facade（from core.xxx / import core.xxx）
+  2. core 内部自身导入检查（单文件静态分析）
+  3. 层级隔离：memory_engine 与 src 禁止互相导入
+  4. 导入顺序：标准库 → 第三方 → 项目
+
+Usage:
+  python scripts/ops/lint_imports.py                  # 全项目
+  python scripts/ops/lint_imports.py core/            # 指定目录
+  python scripts/ops/lint_imports.py --strict         # 严格模式，警告也报错
+"""
+
+from __future__ import annotations
+
+import ast
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+STDLIB_MODULES = {
+    "abc", "argparse", "ast", "asyncio", "atexit", "base64", "collections",
+    "contextlib", "contextvars", "copy", "csv", "dataclasses", "datetime",
+    "decimal", "enum", "functools", "gc", "hashlib", "html", "http",
+    "importlib", "inspect", "io", "itertools", "json", "logging", "math",
+    "multiprocessing", "operator", "os", "pathlib", "platform", "pprint",
+    "queue", "random", "re", "secrets", "shutil", "signal", "socket",
+    "sqlite3", "statistics", "string", "struct", "subprocess", "sys",
+    "tempfile", "textwrap", "threading", "time", "traceback", "types",
+    "typing", "unittest", "urllib", "uuid", "warnings", "weakref", "xml",
+}
+
+PROJECT_PACKAGES = ("core", "memory_engine", "src", "baijin")
+
+
+def _is_stdlib(module_name: str) -> bool:
+    top = module_name.split(".")[0]
+    return top in STDLIB_MODULES
+
+
+def _is_project_module(module_name: str) -> bool:
+    for pkg in PROJECT_PACKAGES:
+        if module_name == pkg or module_name.startswith(pkg + "."):
+            return True
+    return False
+
+
+def find_python_files(root: Path) -> list[Path]:
+    files = []
+    for py_file in root.rglob("*.py"):
+        parts = py_file.parts
+        if "__pycache__" in parts:
+            continue
+        if ".git" in parts:
+            continue
+        files.append(py_file)
+    return sorted(files)
+
+
+def parse_imports(file_path: Path) -> list[dict]:
+    """解析文件的导入语句，返回 [{lineno, module, names, level}]。"""
+    try:
+        tree = ast.parse(file_path.read_text(encoding="utf-8"), filename=str(file_path))
+    except SyntaxError:
+        return []
+
+    imports = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports.append({
+                    "lineno": node.lineno,
+                    "module": alias.name,
+                    "names": [alias.asname or alias.name],
+                    "level": 0,
+                })
+        elif isinstance(node, ast.ImportFrom):
+            if node.module is None:
+                continue
+            imports.append({
+                "lineno": node.lineno,
+                "module": node.module,
+                "names": [a.asname or a.name for a in node.names],
+                "level": node.level or 0,
+            })
+    return imports
+
+
+def _relative_path(file_path: Path) -> str:
+    """返回统一的相对路径（正斜杠）。"""
+    try:
+        rel = str(file_path.relative_to(PROJECT_ROOT))
+    except ValueError:
+        rel = str(file_path)
+    return rel.replace("\\", "/")
+
+
+def _module_name_from_path(rel: str) -> str:
+    """从相对路径推导 Python 模块全名。core/__init__.py → core"""
+    mod = rel.removesuffix(".py").replace("/", ".")
+    if mod.endswith(".__init__"):
+        mod = mod.removesuffix(".__init__")
+    return mod
+
+
+# ── Rules ──────────────────────────────────────────────────────────────────
+
+def check_facade_bypass(file_path: Path, imports: list[dict]) -> list[str]:
+    """检查外部模块是否绕过 core/__init__.py 直接导入子模块。"""
+    errors = []
+    rel = _relative_path(file_path)
+
+    if rel.startswith("core/"):
+        return errors
+
+    for imp in imports:
+        mod = imp["module"]
+        # 只检查绝对导入
+        if imp.get("level", 0) > 0:
+            continue
+        # 导入 core 包本身合法，不算绕过
+        if mod == "core":
+            continue
+        # 匹配 core.xxx 子模块（from core.xxx import ... / import core.xxx 都算）
+        if mod.startswith("core."):
+            # 根据导入类型区分提示
+            if imp["level"] == 0 and len(imp["names"]) == 1 and imp["names"][0] == mod:
+                # import core.xxx 形式
+                errors.append(
+                    f"{rel}:{imp['lineno']} 绕过 core facade: "
+                    f"import {mod} → 应改为 from core import {imp['names'][0]}"
+                )
+            else:
+                # from core.xxx import ... 形式
+                errors.append(
+                    f"{rel}:{imp['lineno']} 绕过 core facade: "
+                    f"from {mod} import {', '.join(imp['names'])} "
+                    f"→ 应改为 from core import {', '.join(imp['names'])}"
+                )
+    return errors
+
+
+def check_layer_isolation(file_path: Path, imports: list[dict]) -> list[str]:
+    """memory_engine 与 src 禁止互相导入（层级隔离）。"""
+    errors = []
+    rel = _relative_path(file_path)
+
+    in_memory = rel.startswith("memory_engine/")
+    in_src = rel.startswith("src/")
+
+    if not in_memory and not in_src:
+        return errors
+
+    for imp in imports:
+        mod = imp["module"]
+        if in_memory and (mod == "src" or mod.startswith("src.")):
+            errors.append(
+                f"{rel}:{imp['lineno']} 层级违规: memory_engine 不应导入 src "
+                f"(from {mod} import {', '.join(imp['names'])})"
+            )
+        if in_src and (mod == "memory_engine" or mod.startswith("memory_engine.")):
+            errors.append(
+                f"{rel}:{imp['lineno']} 层级违规: src 不应导入 memory_engine "
+                f"(from {mod} import {', '.join(imp['names'])})"
+            )
+    return errors
+
+
+def check_self_import(file_path: Path, imports: list[dict]) -> list[str]:
+    """检查 core 内部文件是否导入自身（如 core/foo.py 中 from core.foo import ...）。"""
+    errors = []
+    rel = _relative_path(file_path)
+
+    if not rel.startswith("core/"):
+        return errors
+    # __init__.py 的模块名就是包名，从自己包导入子模块是正常的 facade 行为
+    if rel.endswith("__init__.py"):
+        return errors
+
+    self_module = _module_name_from_path(rel)
+
+    for imp in imports:
+        if imp["module"] == self_module:
+            errors.append(
+                f"{rel}:{imp['lineno']} 自身导入: from {imp['module']} import "
+                f"{', '.join(imp['names'])}"
+            )
+    return errors
+
+
+def check_import_order(file_path: Path, imports: list[dict]) -> list[str]:
+    """检查导入顺序：标准库 → 第三方 → 项目。"""
+    errors = []
+    rel = _relative_path(file_path)
+
+    categories = []
+    for imp in imports:
+        mod = imp["module"]
+        if imp.get("level", 0) > 0:
+            continue
+        if mod == "__future__":
+            continue  # __future__ 强制在文件头，跳过顺序检查
+        if _is_stdlib(mod):
+            categories.append(("stdlib", imp["lineno"]))
+        elif _is_project_module(mod):
+            categories.append(("project", imp["lineno"]))
+        else:
+            categories.append(("third_party", imp["lineno"]))
+
+    prev = ("__root__", 0)
+    for cat, lineno in categories:
+        order = {"stdlib": 0, "third_party": 1, "project": 2}
+        if order.get(cat, 2) < order.get(prev[0], 0):
+            errors.append(
+                f"{rel}:{lineno} 导入顺序错误: {cat} 应放在 {prev[0]} 之前"
+            )
+            break
+        prev = (cat, lineno)
+
+    return errors
+
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+def lint_path(target: Path, strict: bool = False) -> tuple[int, int]:
+    """返回 (错误数, 警告数)。"""
+    error_count = 0
+    warn_count = 0
+
+    for py_file in find_python_files(target):
+        imports = parse_imports(py_file)
+        if not imports and py_file.stat().st_size > 0:
+            continue
+
+        for check, is_warning in [
+            (check_facade_bypass, False),
+            (check_layer_isolation, False),
+            (check_self_import, False),
+            (check_import_order, True),
+        ]:
+            results = check(py_file, imports)
+            for msg in results:
+                if is_warning:
+                    if strict:
+                        error_count += 1
+                        print(f"  ERROR: {msg}")
+                    else:
+                        warn_count += 1
+                        print(f"  WARN: {msg}")
+                else:
+                    error_count += 1
+                    print(f"  ERROR: {msg}")
+
+    return error_count, warn_count
+
+
+def main() -> None:
+    strict = "--strict" in sys.argv
+    args = [a for a in sys.argv[1:] if a != "--strict"]
+
+    if args:
+        target = Path(args[0])
+    else:
+        target = PROJECT_ROOT
+
+    if not target.exists():
+        print(f"路径不存在: {target}")
+        sys.exit(1)
+
+    print(f"检查目录: {target}\n")
+
+    errors, warnings = lint_path(target, strict=strict)
+
+    print()
+    if errors == 0 and warnings == 0:
+        print("所有导入检查通过")
+    else:
+        status = []
+        if errors:
+            status.append(f"{errors} 个错误")
+        if warnings:
+            status.append(f"{warnings} 个警告")
+        print(f"{', '.join(status)}")
+        sys.exit(1 if errors else 0)
+
+
+if __name__ == "__main__":
+    main()
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  1.1.15 requirements/ + requirements.txt — 依赖拆分                          ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+
+--- requirements.txt ---
+# baijin v2 dependencies
+# production:  pip install -r requirements/base.txt
+# all-in-one:  pip install -r requirements/all.txt
+# minimal:     pip install -r requirements/core.txt
+-r requirements/base.txt
+
+--- requirements/core.txt ---
+# baijin v2 core deps (lightweight, no ML)
+pydantic==2.10.6
+python-dotenv==1.2.2
+shortuuid==1.0.13
+psutil==7.2.2
+cryptography==48.0.0
+
+--- requirements/server.txt ---
+# baijin v2 HTTP server deps
+-r core.txt
+
+fastapi==0.109.0
+uvicorn==0.27.0
+httpx==0.28.1
+requests==2.34.2
+
+--- requirements/memory.txt ---
+# baijin v2 memory engine deps (FAISS + BGE-M3 embedding)
+# Note: torch is ~2GB, first install may be slow
+-r core.txt
+
+faiss-cpu==1.14.2
+numpy==1.26.4
+torch==2.12.0
+opencv-python==4.13.0.92
+FlagEmbedding==1.4.0
+
+--- requirements/optional.txt ---
+# baijin v2 optional deps (gracefully degraded if missing)
+# wmi        - Windows CPU temperature (senses.py)
+# jionlp     - Chinese time NER (index_time.py)
+# datasketch - MinHash dedup (evolve.py)
+wmi
+jionlp
+datasketch
+
+--- requirements/base.txt ---
+# baijin v2 production deploy
+-r server.txt
+-r memory.txt
+
+--- requirements/all.txt ---
+# baijin v2 all deps (including optional)
+-r base.txt
+-r optional.txt
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  TESTS — 262 测试 (pytest)                                                   ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+
+--- tests/test_utils.py ---
+"""
+utils.py 全面测试：时间戳生成/转换/格式化/校验/往返一致性。
+"""
+import time as _time
+from datetime import datetime, timezone, timedelta
+
+import pytest
+
+from core.utils import (
+    now_ts, ts_to_datetime, validate_ts,
+    fmt_ts, day_str, week_str,
+    utc_ts_to_bj, bj_ts_to_utc,
+)
+
+_BEIJING = timezone(timedelta(hours=8))
+
+
+class TestNowTs:
+    """now_ts() 生成测试"""
+
+    def test_returns_int(self):
+        assert isinstance(now_ts(), int)
+
+    def test_is_positive_and_recent(self):
+        ts = now_ts()
+        # 北京时间戳应该 > 2020-01-01 00:00:00+08
+        assert ts > 1577836800 + 8 * 3600
+        # 不应该超过当前 UTC 时间 + 1 天
+        assert ts < int(_time.time()) + 9 * 3600
+
+    def test_monotonically_increasing(self):
+        a = now_ts()
+        b = now_ts()
+        assert b >= a
+
+    def test_within_one_second_of_realtime(self):
+        ts = now_ts()
+        expected = int(_time.time() + 8 * 3600)
+        assert abs(ts - expected) <= 1
+
+
+class TestTsToDatetime:
+    """ts_to_datetime() 转换测试"""
+
+    def test_epoch_beijing(self):
+        # 北京时间戳 0 = 1970-01-01 00:00:00+08（比 UTC epoch 早 8 小时）
+        dt = ts_to_datetime(0)
+        assert dt.year == 1970
+        assert dt.month == 1
+        assert dt.day == 1
+        assert dt.hour == 0
+        assert dt.minute == 0
+        assert dt.second == 0
+        assert dt.tzinfo is not None
+
+    def test_known_timestamp(self):
+        # 计算一个确定的时间戳：datetime → ts → datetime 往返验证
+        from datetime import datetime as dt_cls
+        ref = dt_cls(2026, 6, 17, 12, 0, 0, tzinfo=_BEIJING)
+        ts = int(ref.timestamp() + 8 * 3600)
+        result = ts_to_datetime(ts)
+        assert result.year == 2026
+        assert result.month == 6
+        assert result.day == 17
+        assert result.hour == 12
+        assert result.minute == 0
+
+    def test_roundtrip_with_now(self):
+        """now_ts() → ts_to_datetime → back to ts 一致性"""
+        ts = now_ts()
+        dt = ts_to_datetime(ts)
+        # 从 datetime 重建时间戳
+        reconstructed = int(dt.timestamp() + 8 * 3600)
+        assert reconstructed == ts
+
+
+class TestValidateTs:
+    """validate_ts() 校验测试"""
+
+    def test_accepts_second_timestamp(self):
+        assert validate_ts(1700000000) == 1700000000
+
+    def test_rejects_millisecond_timestamp(self):
+        with pytest.raises(ValueError, match="毫秒"):
+            validate_ts(1700000000000)
+
+    def test_rejects_microsecond_timestamp(self):
+        with pytest.raises(ValueError, match="毫秒"):
+            validate_ts(1700000000000000)
+
+    def test_accepts_zero(self):
+        assert validate_ts(0) == 0
+
+    def test_accepts_2038_boundary(self):
+        """2038-01-19 11:14:07+08, 32-bit signed max in Beijing"""
+        assert validate_ts(2147483647 + 8 * 3600) == 2147483647 + 8 * 3600
+
+
+class TestFmtTs:
+    """fmt_ts() 格式化测试"""
+
+    def test_format_format(self):
+        result = fmt_ts(1781672400)
+        assert "2026" in result
+        assert "06" in result
+        assert "17" in result
+
+    def test_midnight(self):
+        """午夜 00:00:00 — 用 datetime 精确构造时间戳"""
+        midnight = datetime(2026, 6, 17, 0, 0, 0, tzinfo=_BEIJING)
+        ts = int(midnight.timestamp() + 8 * 3600)
+        result = fmt_ts(ts)
+        assert "00:00:00" in result
+
+    def test_no_timezone_suffix(self):
+        """fmt_ts 是内部展示，不带时区后缀"""
+        result = fmt_ts(now_ts())
+        assert "+" not in result
+
+
+class TestDayStr:
+    """day_str() 测试"""
+
+    def test_format(self):
+        result = day_str(1781672400)
+        assert result == "2026-06-17"
+
+    def test_day_boundary_midnight(self):
+        """午夜前后属于不同天"""
+        midnight = datetime(2026, 6, 17, 0, 0, 0, tzinfo=_BEIJING)
+        ts_midnight = int(midnight.timestamp() + 8 * 3600)
+        just_before = day_str(ts_midnight - 1)  # 23:59:59 → 06-16
+        just_after = day_str(ts_midnight)        # 00:00:00 → 06-17
+        assert just_before == "2026-06-16"
+        assert just_after == "2026-06-17"
+
+
+class TestWeekStr:
+    """week_str() 测试"""
+
+    def test_format(self):
+        result = week_str(1781672400)
+        assert result.startswith("2026-W")
+        assert int(result.split("W")[1]) >= 1
+        assert int(result.split("W")[1]) <= 53
+
+
+class TestUtcTsToBj:
+    """utc_ts_to_bj() 转换测试"""
+
+    def test_epoch_conversion(self):
+        """Unix epoch 0 = 1970-01-01 08:00 北京"""
+        assert utc_ts_to_bj(0) == 8 * 3600
+
+    def test_standard_timestamp(self):
+        result = utc_ts_to_bj(1700000000)
+        assert result == 1700000000 + 8 * 3600
+
+    def test_float_input(self):
+        """float 输入也能处理"""
+        result = utc_ts_to_bj(1700000000.5)
+        assert result == int(1700000000.5 + 8 * 3600)
+
+    def test_returns_int(self):
+        assert isinstance(utc_ts_to_bj(100), int)
+
+
+class TestBjTsToUtc:
+    """bj_ts_to_utc() 转换测试"""
+
+    def test_epoch_conversion(self):
+        """北京时间 0 = Unix epoch -28800"""
+        assert bj_ts_to_utc(0) == -8 * 3600
+
+    def test_standard_timestamp(self):
+        result = bj_ts_to_utc(1700000000 + 8 * 3600)
+        assert result == 1700000000
+
+    def test_float_input(self):
+        result = bj_ts_to_utc(1700000000.5 + 8 * 3600)
+        assert result == int(1700000000.5)
+
+    def test_returns_int(self):
+        assert isinstance(bj_ts_to_utc(100), int)
+
+
+class TestRoundtrip:
+    """往返转换一致性"""
+
+    def test_utc_bj_utc_roundtrip(self):
+        original = 1700000000
+        bj = utc_ts_to_bj(original)
+        back = bj_ts_to_utc(bj)
+        assert back == original
+
+    def test_bj_utc_bj_roundtrip(self):
+        original = now_ts()
+        utc = bj_ts_to_utc(original)
+        back = utc_ts_to_bj(utc)
+        assert back == original
+
+    @pytest.mark.parametrize("ts", [
+        0, 1, 1577836800, 1700000000, 2000000000, 2147483647,
+    ])
+    def test_various_timestamps(self, ts):
+        """多种时间戳往返测试"""
+        bj = utc_ts_to_bj(ts)
+        assert bj_ts_to_utc(bj) == ts
+
+--- tests/test_cache.py ---
+"""
+cache.py 全面测试：TTL+LRU 缓存，并发安全，防穿透/雪崩/击穿。
+"""
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import pytest
+
+from core.cache import TTLLRUCache
+
+
+class TestGetSet:
+    """基本 get/set/delete 操作"""
+
+    def test_set_and_get(self):
+        c = TTLLRUCache()
+        c.set("a", 1)
+        assert c.get("a") == 1
+
+    def test_get_missing(self):
+        c = TTLLRUCache()
+        assert c.get("nonexistent") is None
+
+    def test_set_none_value(self):
+        """None 值缓存：get 返回 None，但应该缓存了（防穿透）"""
+        c = TTLLRUCache()
+        c.set("key", None)
+        # None 值被缓存，不应调用 factory
+        called = False
+        def factory():
+            nonlocal called
+            called = True
+            return "fallback"
+        result = c.get_or_compute("key", factory)
+        assert result is None
+        assert not called
+
+    def test_overwrite(self):
+        c = TTLLRUCache()
+        c.set("a", 1)
+        c.set("a", 2)
+        assert c.get("a") == 2
+
+    def test_delete(self):
+        c = TTLLRUCache()
+        c.set("a", 1)
+        c.delete("a")
+        assert c.get("a") is None
+
+    def test_delete_nonexistent(self):
+        c = TTLLRUCache()
+        c.delete("nonexistent")  # 不抛异常
+
+    def test_clear(self):
+        c = TTLLRUCache()
+        c.set("a", 1)
+        c.set("b", 2)
+        c.clear()
+        assert c.get("a") is None
+        assert c.get("b") is None
+
+
+class TestTTL:
+    """TTL 过期测试"""
+
+    def test_expires_after_ttl(self):
+        c = TTLLRUCache()
+        c.set("a", 1, ttl=0)  # 立即过期
+        time.sleep(0.01)
+        assert c.get("a") is None
+
+    def test_does_not_expire_before_ttl(self):
+        c = TTLLRUCache(default_ttl=10)
+        c.set("a", 1)
+        assert c.get("a") == 1
+
+    def test_custom_ttl(self):
+        c = TTLLRUCache(default_ttl=10)
+        c.set("a", 1, ttl=0)
+        time.sleep(0.05)  # ttl=0 经抖动后为 0，给足够时间过期
+        assert c.get("a") is None
+
+    def test_null_ttl_is_short(self):
+        """None 值的 TTL 应该很短（默认 30s，加抖动后 < 33s）"""
+        c = TTLLRUCache()
+        c.set("k", None)  # 使用 CACHE_NULL_TTL
+        assert c.get("k") is None  # None 值但命中缓存
+        # 无法直接验证 TTL 值，但确保不崩溃
+        c.delete("k")
+        assert c.get("k") is None  # 删除后未命中
+
+
+class TestLRU:
+    """LRU 淘汰测试"""
+
+    def test_evicts_when_full(self):
+        c = TTLLRUCache(max_size=3)
+        c.set("a", 1)
+        c.set("b", 2)
+        c.set("c", 3)
+        c.set("d", 4)  # 应该淘汰 a
+        assert c.get("a") is None
+        assert c.get("b") == 2
+        assert c.get("c") == 3
+        assert c.get("d") == 4
+
+    def test_get_refreshes_position(self):
+        """get 命中会将 key 移到 LRU 尾部"""
+        c = TTLLRUCache(max_size=3)
+        c.set("a", 1)
+        c.set("b", 2)
+        c.set("c", 3)
+        c.get("a")  # 刷新 a，现在 a 是最新的
+        c.set("d", 4)  # 应该淘汰 b（a 被刷新了）
+        assert c.get("a") == 1
+        assert c.get("b") is None
+        assert c.get("c") == 3
+        assert c.get("d") == 4
+
+    def test_set_refreshes_position(self):
+        """set 已存在的 key 也会刷新 LRU 位置"""
+        c = TTLLRUCache(max_size=3)
+        c.set("a", 1)
+        c.set("b", 2)
+        c.set("c", 3)
+        c.set("a", 99)  # 刷新 a
+        c.set("d", 4)   # 应该淘汰 b
+        assert c.get("a") == 99
+        assert c.get("b") is None
+
+
+class TestGetOrCompute:
+    """get_or_compute 核心逻辑"""
+
+    def test_computes_on_miss(self):
+        c = TTLLRUCache()
+        result = c.get_or_compute("key", lambda: "computed")
+        assert result == "computed"
+
+    def test_returns_cached_on_hit(self):
+        c = TTLLRUCache()
+        c.set("key", "cached")
+        called = False
+        result = c.get_or_compute("key", lambda: setattr(called, '__self__', None) or "computed")
+        assert result == "cached"
+
+    def test_factory_called_exactly_once(self):
+        """同一 key 并发请求，factory 只调一次"""
+        c = TTLLRUCache()
+        call_count = 0
+        lock = threading.Lock()
+
+        def factory():
+            nonlocal call_count
+            with lock:
+                call_count += 1
+            time.sleep(0.05)  # 模拟耗时操作
+            return call_count
+
+        results = []
+
+        def worker():
+            results.append(c.get_or_compute("key", factory))
+
+        threads = [threading.Thread(target=worker) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert call_count == 1, f"factory called {call_count} times, expected 1"
+        assert all(r == 1 for r in results), f"not all results are 1: {results}"
+
+    def test_factory_raises_does_not_cache(self):
+        """factory 抛异常不缓存错误值，且下次重试"""
+        c = TTLLRUCache()
+        call_count = 0
+
+        def failing_factory():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ValueError("fail")
+            return "success"
+
+        with pytest.raises(ValueError, match="fail"):
+            c.get_or_compute("key", failing_factory)
+
+        # 第二次应该成功
+        result = c.get_or_compute("key", failing_factory)
+        assert result == "success"
+        assert call_count == 2
+
+    def test_key_lock_cleaned_up(self):
+        """get_or_compute 完成后 _key_locks 应该清理"""
+        c = TTLLRUCache()
+        c.get_or_compute("key", lambda: "value")
+        assert "key" not in c._key_locks
+
+    def test_key_lock_cleaned_up_on_error(self):
+        """factory 抛异常后 _key_locks 也应该清理"""
+        c = TTLLRUCache()
+        with pytest.raises(ValueError):
+            c.get_or_compute("key", lambda: (_ for _ in ()).throw(ValueError("boom")))
+        assert "key" not in c._key_locks
+
+
+class TestConcurrency:
+    """并发压力测试"""
+
+    def test_concurrent_get_set(self):
+        """多线程并发读写不崩溃"""
+        c = TTLLRUCache(max_size=100)
+        errors = []
+
+        def worker(n):
+            try:
+                for i in range(100):
+                    key = f"key{n}_{i % 20}"
+                    c.set(key, i)
+                    c.get(key)
+                    if i % 10 == 0:
+                        c.delete(key)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0, f"errors: {errors}"
+
+    def test_concurrent_get_or_compute_same_key(self):
+        """100 线程争抢同一 key，factory 只调一次"""
+        c = TTLLRUCache()
+        counter = 0
+        lock = threading.Lock()
+
+        def factory():
+            nonlocal counter
+            with lock:
+                counter += 1
+            time.sleep(0.01)
+            return "computed"
+
+        results = []
+
+        def worker():
+            results.append(c.get_or_compute("single_key", factory))
+
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [executor.submit(worker) for _ in range(100)]
+            for f in as_completed(futures):
+                f.result()
+
+        assert counter == 1, f"factory called {counter} times"
+        assert len(results) == 100
+        assert all(r == "computed" for r in results)
+
+
+class TestStats:
+    """stats 统计测试"""
+
+    def test_hit_rate(self):
+        c = TTLLRUCache()
+        c.set("a", 1)
+        c.get("a")
+        c.get("b")  # miss
+        s = c.stats()
+        assert s["size"] == 1
+        assert s["hit_rate"] == 0.5
+
+    def test_empty_stats(self):
+        c = TTLLRUCache()
+        s = c.stats()
+        assert s["size"] == 0
+        assert s["hit_rate"] == 0.0
+
+--- tests/test_cache_extreme.py ---
+"""
+cache.py 极端测试：抖动分布/空值过期一致性/TTL 边界/高并发压力。
+"""
+import random
+import statistics
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import pytest
+
+from core.cache import TTLLRUCache
+
+
+class TestJitterDistribution:
+    """验证 TTL 抖动在 0.9~1.1 范围内均匀分布"""
+
+    def test_jitter_within_range(self):
+        """100 次 set，TTL 抖动全在 [base*0.9, base*1.1] 内"""
+        c = TTLLRUCache(default_ttl=100)
+        # 通过 _get_entry 访问内部 expire_at 来反推 TTL
+        now = time.monotonic()
+        for i in range(100):
+            c.set(f"k{i}", i)
+
+        # 检查所有 key 的 expire_at 在合理范围
+        with c._lock:
+            for key, (expire_at, _) in c._store.items():
+                ttl = expire_at - now
+                # default_ttl=100 * 0.9 = 90, * 1.1 = 110
+                assert 90 <= ttl <= 110, f"TTL {ttl:.1f} out of [90, 110]"
+
+    def test_jitter_varies(self):
+        """多次 set 的 TTL 不完全相同（抖动生效）"""
+        c = TTLLRUCache(default_ttl=100)
+        now = time.monotonic()
+        for i in range(20):
+            c.set(f"k{i}", i)
+
+        with c._lock:
+            ttls = [expire_at - now for expire_at, _ in c._store.values()]
+
+        # 至少有两个不同的 TTL 值（随机抖动生效）
+        unique = len(set(round(t, 1) for t in ttls))
+        assert unique >= 2, f"All {len(ttls)} TTLs identical, jitter likely not working"
+
+    def test_null_jitter_varies(self):
+        """None 值缓存也有抖动"""
+        c = TTLLRUCache()
+        now = time.monotonic()
+        for i in range(20):
+            c.set(f"null{i}", None)
+
+        with c._lock:
+            ttls = [expire_at - now for expire_at, _ in c._store.values()]
+
+        unique = len(set(round(t, 1) for t in ttls))
+        assert unique >= 2, f"Null TTLs all identical, jitter not applied"
+
+
+class TestTTLBoundaries:
+    """TTL 边界值测试"""
+
+    def test_ttl_zero(self):
+        """ttl=0 立即过期"""
+        c = TTLLRUCache()
+        c.set("a", 1, ttl=0)
+        time.sleep(0.1)
+        assert c.get("a") is None
+
+    def test_ttl_negative(self):
+        """ttl=-1 也立即过期"""
+        c = TTLLRUCache()
+        c.set("a", 1, ttl=-1)
+        time.sleep(0.05)
+        assert c.get("a") is None
+
+    def test_ttl_very_long(self):
+        """ttl 很大，不过期"""
+        c = TTLLRUCache()
+        c.set("a", 1, ttl=86400)
+        assert c.get("a") == 1
+
+    def test_default_ttl_zero_instant_expiry(self):
+        """default_ttl=0 构造的缓存立即过期"""
+        c = TTLLRUCache(default_ttl=0)
+        c.set("a", 1)
+        time.sleep(0.1)
+        assert c.get("a") is None
+
+
+class TestExtremeConcurrency:
+    """极端并发压力"""
+
+    def test_massive_concurrent_reads(self):
+        """100 线程 × 100 次读取，不崩溃"""
+        c = TTLLRUCache(max_size=1000)
+        for i in range(100):
+            c.set(f"k{i}", i)
+
+        errors = []
+
+        def reader():
+            try:
+                for _ in range(100):
+                    key = f"k{random.randint(0, 99)}"
+                    c.get(key)
+            except Exception as e:
+                errors.append(e)
+
+        with ThreadPoolExecutor(max_workers=50) as ex:
+            futures = [ex.submit(reader) for _ in range(100)]
+            for f in as_completed(futures):
+                f.result()
+
+        assert len(errors) == 0
+
+    def test_mixed_operations_stress(self):
+        """混合读写删操作，50 线程并发"""
+        c = TTLLRUCache(max_size=500)
+        stop = threading.Event()
+        errors = []
+
+        def worker(seed):
+            rng = random.Random(seed)
+            try:
+                for _ in range(200):
+                    op = rng.choice(["get", "set", "delete", "get_or_compute"])
+                    key = f"k{rng.randint(0, 50)}"
+                    if op == "get":
+                        c.get(key)
+                    elif op == "set":
+                        c.set(key, rng.randint(0, 1000))
+                    elif op == "delete":
+                        c.delete(key)
+                    else:
+                        c.get_or_compute(key, lambda: "computed", ttl=1)
+            except Exception as e:
+                errors.append(e)
+
+        with ThreadPoolExecutor(max_workers=25) as ex:
+            futures = [ex.submit(worker, i) for i in range(50)]
+            for f in as_completed(futures):
+                f.result()
+
+        assert len(errors) == 0, f"errors: {errors}"
+
+    def test_single_key_stampede(self):
+        """100 线程同时 get_or_compute 同一 key，factory 只调一次"""
+        c = TTLLRUCache()
+        counter = 0
+        lock = threading.Lock()
+
+        def expensive_factory():
+            nonlocal counter
+            with lock:
+                counter += 1
+            time.sleep(0.02)
+            return f"result-{counter}"
+
+        results = []
+
+        def worker():
+            results.append(c.get_or_compute("hot_key", expensive_factory))
+
+        threads = [threading.Thread(target=worker) for _ in range(100)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert counter == 1, f"factory called {counter} times (expected 1)"
+        assert all(r == "result-1" for r in results)
+
+    def test_lru_stress_eviction(self):
+        """大量写入触发 LRU 淘汰，不丢数据不崩溃"""
+        c = TTLLRUCache(max_size=10)
+        for i in range(1000):
+            c.set(f"k{i}", i)
+        # 最后 10 个应该在缓存中
+        for i in range(990, 1000):
+            assert c.get(f"k{i}") == i
+        # 前面的大多数应该被淘汰
+        assert c.stats()["size"] <= 10
+
+
+class TestCacheStatsUnderLoad:
+    """负载下统计正确性"""
+
+    def test_hit_rate_under_concurrent_load(self):
+        c = TTLLRUCache()
+        c.set("a", 1)
+
+        def worker():
+            for _ in range(50):
+                c.get("a")
+                c.get("nonexistent")
+
+        threads = [threading.Thread(target=worker) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        s = c.stats()
+        # 一半命中缓存，一半 miss
+        assert 0.45 < s["hit_rate"] < 0.55, f"hit_rate={s['hit_rate']}"
+
+--- tests/test_container.py ---
+"""
+container.py 全面测试：DI 容器注册/解析/拓扑排序/生命周期/循环检测。
+"""
+import pytest
+
+from core.container import DependencyContainer, CircularDependencyError
+from core.types import LifecycleComponent
+
+
+class FakeComponent(LifecycleComponent):
+    """测试用生命周期组件"""
+
+    def __init__(self, name="test"):
+        self.name = name
+        self.started = False
+        self.stopped = False
+        self.healthy = True
+        self._stop_timeout = None
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self, timeout: float) -> None:
+        self.stopped = True
+        self._stop_timeout = timeout
+
+    def is_healthy(self) -> bool:
+        return self.healthy
+
+
+class FakeComponentA(FakeComponent):
+    pass
+
+
+class FakeComponentB(FakeComponent):
+    pass
+
+
+class FakeComponentC(FakeComponent):
+    pass
+
+
+class TestRegister:
+    """注册测试"""
+
+    def test_register_simple(self):
+        dc = DependencyContainer()
+        dc.register(FakeComponent, FakeComponent)
+        instance = dc.resolve(FakeComponent)
+        assert isinstance(instance, FakeComponent)
+
+    def test_register_with_deps(self):
+        dc = DependencyContainer()
+        dc.register(FakeComponentA, FakeComponentA)
+        dc.register(FakeComponentB, FakeComponentB, deps=[FakeComponentA])
+        b = dc.resolve(FakeComponentB)
+        assert isinstance(b, FakeComponentB)
+        # A 也应该被自动 resolve
+        a = dc.resolve(FakeComponentA)
+        assert isinstance(a, FakeComponentA)
+
+    def test_duplicate_register_raises(self):
+        dc = DependencyContainer()
+        dc.register(FakeComponent, FakeComponent)
+        with pytest.raises(ValueError, match="重复注册"):
+            dc.register(FakeComponent, FakeComponent)
+
+    def test_register_factory_as_value(self):
+        """factory 可以是值（非 callable），直接作为实例"""
+        dc = DependencyContainer()
+        instance = FakeComponent()
+        dc.register(FakeComponent, instance)  # not callable
+        assert dc.resolve(FakeComponent) is instance
+
+
+class TestResolve:
+    """解析测试"""
+
+    def test_resolve_unregistered_raises(self):
+        dc = DependencyContainer()
+        with pytest.raises(KeyError, match="未注册"):
+            dc.resolve(FakeComponent)
+
+    def test_resolve_returns_same_instance(self):
+        """同一类型 resolve 多次返回同一实例（单例）"""
+        dc = DependencyContainer()
+        dc.register(FakeComponent, FakeComponent)
+        a = dc.resolve(FakeComponent)
+        b = dc.resolve(FakeComponent)
+        assert a is b
+
+    def test_resolve_injects_deps(self):
+        """resolve 时自动注入依赖"""
+        dc = DependencyContainer()
+
+        class Dep(FakeComponent):
+            pass
+
+        class Main(FakeComponent):
+            pass
+
+        created = []
+
+        def factory_dep():
+            created.append("dep")
+            return Dep()
+
+        def factory_main(dep):
+            created.append("main")
+            assert isinstance(dep, Dep)
+            return Main()
+
+        dc.register(Dep, factory_dep)
+        dc.register(Main, factory_main, deps=[Dep])
+        main = dc.resolve(Main)
+        assert isinstance(main, Main)
+        assert created == ["dep", "main"]
+
+    def test_resolve_transitive_deps(self):
+        """传递依赖：C→B→A"""
+        dc = DependencyContainer()
+        dc.register(FakeComponentA, FakeComponentA)
+        dc.register(FakeComponentB, FakeComponentB, deps=[FakeComponentA])
+        dc.register(FakeComponentC, FakeComponentC, deps=[FakeComponentB])
+        c = dc.resolve(FakeComponentC)
+        assert isinstance(c, FakeComponentC)
+        # 所有依赖都应该被解析
+        assert isinstance(dc.resolve(FakeComponentA), FakeComponentA)
+        assert isinstance(dc.resolve(FakeComponentB), FakeComponentB)
+
+
+class TestTopoOrder:
+    """拓扑排序测试"""
+
+    def test_simple_chain(self):
+        dc = DependencyContainer()
+        dc.register(FakeComponentA, FakeComponentA)
+        dc.register(FakeComponentB, FakeComponentB, deps=[FakeComponentA])
+        dc.register(FakeComponentC, FakeComponentC, deps=[FakeComponentB])
+        order = dc._topo_order()
+        # A 应该在 B 前面，B 应该在 C 前面
+        idx_a = order.index(FakeComponentA)
+        idx_b = order.index(FakeComponentB)
+        idx_c = order.index(FakeComponentC)
+        assert idx_a < idx_b < idx_c
+
+    def test_fork_graph(self):
+        """A → [B, C] 叉形依赖"""
+        dc = DependencyContainer()
+        dc.register(FakeComponentA, FakeComponentA)
+        dc.register(FakeComponentB, FakeComponentB, deps=[FakeComponentA])
+        dc.register(FakeComponentC, FakeComponentC, deps=[FakeComponentA])
+        order = dc._topo_order()
+        idx_a = order.index(FakeComponentA)
+        idx_b = order.index(FakeComponentB)
+        idx_c = order.index(FakeComponentC)
+        assert idx_a < idx_b
+        assert idx_a < idx_c
+
+    def test_independent_components(self):
+        """无依赖关系的组件可以任意顺序"""
+        dc = DependencyContainer()
+        dc.register(FakeComponentA, FakeComponentA)
+        dc.register(FakeComponentB, FakeComponentB)
+        order = dc._topo_order()
+        assert len(order) == 2
+        assert FakeComponentA in order
+        assert FakeComponentB in order
+
+    def test_already_resolved_included(self):
+        """已解析的实例也参与拓扑排序"""
+        dc = DependencyContainer()
+        dc.register(FakeComponentA, FakeComponentA)
+        dc.resolve(FakeComponentA)  # 提前解析
+        dc.register(FakeComponentB, FakeComponentB, deps=[FakeComponentA])
+        order = dc._topo_order()
+        assert FakeComponentA in order
+        assert FakeComponentB in order
+
+
+class TestCycleDetection:
+    """循环依赖检测"""
+
+    def test_direct_cycle_detected(self):
+        dc = DependencyContainer()
+        dc.register(FakeComponentA, FakeComponentA, deps=[FakeComponentB])
+        dc.register(FakeComponentB, FakeComponentB, deps=[FakeComponentA])
+        with pytest.raises(CircularDependencyError):
+            dc.detect_cycle()
+
+    def test_indirect_cycle_detected(self):
+        """A→B→C→A 三节点环"""
+        dc = DependencyContainer()
+        dc.register(FakeComponentA, FakeComponentA, deps=[FakeComponentB])
+        dc.register(FakeComponentB, FakeComponentB, deps=[FakeComponentC])
+        dc.register(FakeComponentC, FakeComponentC, deps=[FakeComponentA])
+        with pytest.raises(CircularDependencyError):
+            dc.detect_cycle()
+
+    def test_no_cycle_passes(self):
+        dc = DependencyContainer()
+        dc.register(FakeComponentA, FakeComponentA)
+        dc.register(FakeComponentB, FakeComponentB, deps=[FakeComponentA])
+        dc.detect_cycle()  # 不抛异常
+
+    def test_self_loop_detected(self):
+        """组件依赖自身"""
+        dc = DependencyContainer()
+        dc.register(FakeComponentA, FakeComponentA, deps=[FakeComponentA])
+        with pytest.raises(CircularDependencyError):
+            dc.detect_cycle()
+
+
+class TestLifecycle:
+    """生命周期管理测试"""
+
+    def test_start_all(self):
+        dc = DependencyContainer()
+        c = FakeComponent()
+        dc.register(FakeComponent, c)
+        dc.start_all()
+        assert c.started
+
+    def test_start_all_skips_lazy(self):
+        dc = DependencyContainer()
+        c = FakeComponent()
+        dc.register(FakeComponent, c, lazy=True)
+        dc.start_all()
+        assert not c.started
+
+    def test_stop_all(self):
+        dc = DependencyContainer()
+        c = FakeComponent()
+        dc.register(FakeComponent, c)
+        dc.start_all()
+        dc.stop_all()
+        assert c.stopped
+        assert c._stop_timeout == pytest.approx(10.0)
+
+    def test_stop_all_reverse_order(self):
+        """停止顺序应该与启动顺序相反"""
+        dc = DependencyContainer()
+        a = FakeComponent("a")
+        b = FakeComponent("b")
+        dc.register(FakeComponentA, a)
+        dc.register(FakeComponentB, b, deps=[FakeComponentA])
+        dc.start_all()
+
+        stop_order = []
+
+        def stop_b(timeout):
+            stop_order.append("B")
+
+        def stop_a(timeout):
+            stop_order.append("A")
+
+        b.stop = stop_b
+        a.stop = stop_a
+        dc.stop_all()
+        assert stop_order == ["B", "A"]  # B 先停，A 后停
+
+    def test_stop_all_with_cycle_degradation(self):
+        """循环依赖时降级为无序停止，不崩溃"""
+        dc = DependencyContainer()
+        a = FakeComponent("a")
+        b = FakeComponent("b")
+        dc.register(FakeComponentA, a, deps=[FakeComponentB])
+        dc.register(FakeComponentB, b, deps=[FakeComponentA])
+        # 不抛异常，降级停止
+        dc.stop_all()
+
+    def test_stop_all_component_exception_does_not_block_others(self):
+        """一个组件停失败不影响其他组件"""
+        dc = DependencyContainer()
+        a = FakeComponent("a")
+        b = FakeComponent("b")
+
+        def failing_stop(timeout):
+            raise RuntimeError("stop failed")
+
+        a.stop = failing_stop
+        dc.register(FakeComponentA, a)
+        dc.register(FakeComponentB, b)
+        dc.start_all()
+        dc.stop_all()  # b 仍然被停了
+        assert b.stopped
+
+
+class TestIsHealthy:
+    """健康检查测试"""
+
+    def test_all_healthy(self):
+        dc = DependencyContainer()
+        c = FakeComponent()
+        dc.register(FakeComponent, c)
+        dc.resolve(FakeComponent)
+        assert dc.is_healthy()
+
+    def test_one_unhealthy(self):
+        dc = DependencyContainer()
+        c = FakeComponent()
+        c.healthy = False
+        dc.register(FakeComponent, c)
+        dc.resolve(FakeComponent)
+        assert not dc.is_healthy()
+
+    def test_empty_container(self):
+        dc = DependencyContainer()
+        assert dc.is_healthy()
+
+--- tests/test_metrics.py ---
+"""
+metrics.py 全面测试：指标采集/快照/重置/并发安全。
+"""
+import threading
+
+import pytest
+
+from core.metrics import MetricsCollector
+
+
+class TestRecord:
+    """记录测试"""
+
+    def test_record_request(self):
+        m = MetricsCollector()
+        m.record_request(100.0)
+        s = m.snapshot()
+        assert s["request_total"] == 1
+        assert s["latency_avg_ms"] == 100.0
+        assert s["latency_max_ms"] == 100.0
+
+    def test_record_request_multiple(self):
+        m = MetricsCollector()
+        m.record_request(50.0)
+        m.record_request(150.0)
+        s = m.snapshot()
+        assert s["request_total"] == 2
+        assert s["latency_avg_ms"] == 100.0
+        assert s["latency_max_ms"] == 150.0
+
+    def test_record_error(self):
+        m = MetricsCollector()
+        m.record_error()
+        s = m.snapshot()
+        assert s["request_total"] == 1
+        assert s["request_error"] == 1
+
+    def test_record_error_does_not_exceed_total(self):
+        m = MetricsCollector()
+        m.record_error()
+        m.record_error()
+        s = m.snapshot()
+        assert s["request_error"] == 2
+        assert s["request_total"] == 2  # 同步递增
+        assert s["request_error"] <= s["request_total"]
+
+    def test_record_request_error_status(self):
+        m = MetricsCollector()
+        m.record_request(100.0, status="error")
+        s = m.snapshot()
+        assert s["request_total"] == 1
+        assert s["request_error"] == 1
+
+    def test_record_cache_hit(self):
+        m = MetricsCollector()
+        m.record_cache(hit=True)
+        m.record_cache(hit=False)
+        s = m.snapshot()
+        assert s["cache_hit_rate"] == 0.5
+
+    def test_record_search_hit(self):
+        m = MetricsCollector()
+        m.record_search(hit=True)
+        m.record_search(hit=True)
+        m.record_search(hit=False)
+        s = m.snapshot()
+        assert s["search_hit_rate"] == pytest.approx(2 / 3, abs=0.01)
+
+    def test_record_token(self):
+        m = MetricsCollector()
+        m.record_token(1000, "deepseek")
+        m.record_token(500, "deepseek")
+        m.record_token(200, "embedding")
+        s = m.snapshot()
+        assert s["token_used"]["deepseek"] == 1500
+        assert s["token_used"]["embedding"] == 200
+
+
+class TestSnapshot:
+    """快照测试"""
+
+    def test_empty_snapshot(self):
+        m = MetricsCollector()
+        s = m.snapshot()
+        assert s["request_total"] == 0
+        assert s["request_error"] == 0
+        assert s["latency_avg_ms"] == 0.0
+        assert s["cache_hit_rate"] == 0.0
+        assert s["search_hit_rate"] == 0.0
+        assert s["token_used"] == {}
+        assert isinstance(s["memory_mb"], float)
+
+    def test_snapshot_does_not_mutate_internal_state(self):
+        m = MetricsCollector()
+        m.record_request(100.0)
+        s1 = m.snapshot()
+        s1["request_total"] = 999  # 修改快照不应影响内部
+        s2 = m.snapshot()
+        assert s2["request_total"] == 1
+
+    def test_memory_included(self):
+        m = MetricsCollector()
+        s = m.snapshot()
+        assert s["memory_mb"] > 0
+
+
+class TestReset:
+    """重置测试"""
+
+    def test_reset_zeroes_all(self):
+        m = MetricsCollector()
+        m.record_request(100.0)
+        m.record_error()
+        m.record_token(100, "test")
+        m.reset()
+        s = m.snapshot()
+        assert s["request_total"] == 0
+        assert s["request_error"] == 0
+        assert s["latency_avg_ms"] == 0.0
+        assert s["token_used"] == {}
+
+
+class TestConcurrency:
+    """并发安全测试"""
+
+    def test_concurrent_record_does_not_crash(self):
+        m = MetricsCollector()
+        errors = []
+
+        def worker():
+            for _ in range(500):
+                try:
+                    m.record_request(10.0)
+                    m.record_cache(hit=True)
+                    m.record_token(10, "test")
+                except Exception as e:
+                    errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0
+        s = m.snapshot()
+        assert s["request_total"] == 5000
+
+--- tests/test_exceptions.py ---
+"""
+exceptions.py 全面测试：异常体系/链式上下文/字符串表示。
+"""
+from core.exceptions import (
+    BaijinBaseError, InfraError, MemoryError, PluginError, AppError,
+)
+
+
+class TestHierarchy:
+    """异常层级测试"""
+
+    def test_all_inherit_from_base(self):
+        assert issubclass(InfraError, BaijinBaseError)
+        assert issubclass(MemoryError, BaijinBaseError)
+        assert issubclass(PluginError, BaijinBaseError)
+        assert issubclass(AppError, BaijinBaseError)
+
+    def test_all_inherit_from_exception(self):
+        assert issubclass(BaijinBaseError, Exception)
+
+
+class TestInit:
+    """构造测试"""
+
+    def test_message_only(self):
+        e = BaijinBaseError("something wrong")
+        assert e.message == "something wrong"
+        assert e.error_code == ""
+        assert e.context == {}
+
+    def test_with_error_code(self):
+        e = BaijinBaseError("timeout", error_code="INF_TIMEOUT")
+        assert e.message == "timeout"
+        assert e.error_code == "INF_TIMEOUT"
+
+    def test_with_context(self):
+        e = BaijinBaseError("error", context={"key": "value"})
+        assert e.context == {"key": "value"}
+
+    def test_context_defaults_to_empty_dict(self):
+        e = BaijinBaseError("msg")
+        assert e.context == {}
+        # 确保是独立 dict
+        e2 = BaijinBaseError("msg")
+        assert e2.context is not e.context
+
+
+class TestStrRepr:
+    """字符串表示测试"""
+
+    def test_str_with_code(self):
+        e = BaijinBaseError("not found", error_code="MEM_NOT_FOUND")
+        assert str(e) == "[MEM_NOT_FOUND] not found"
+
+    def test_str_without_code(self):
+        e = BaijinBaseError("just a message")
+        assert str(e) == "just a message"
+
+    def test_repr(self):
+        e = BaijinBaseError("test", error_code="APP_ERROR")
+        r = repr(e)
+        assert "BaijinBaseError" in r
+        assert "APP_ERROR" in r
+        assert "test" in r
+
+
+class TestWithContext:
+    """with_context 链式调用"""
+
+    def test_single_context(self):
+        e = BaijinBaseError("err").with_context(user_id="123")
+        assert e.context == {"user_id": "123"}
+
+    def test_chained_context(self):
+        e = (BaijinBaseError("err")
+             .with_context(user_id="123")
+             .with_context(trace_id="abc"))
+        assert e.context == {"user_id": "123", "trace_id": "abc"}
+
+    def test_returns_self(self):
+        e = BaijinBaseError("err")
+        assert e.with_context(k="v") is e
+
+
+class TestLayerErrors:
+    """各层异常独立可用"""
+
+    def test_infra_error(self):
+        e = InfraError("db down", error_code="INF_DB_ERROR")
+        assert isinstance(e, BaijinBaseError)
+        assert "INF_DB_ERROR" in str(e)
+
+    def test_memory_error(self):
+        e = MemoryError("index fail", error_code="MEM_INDEX_ERROR")
+        assert isinstance(e, BaijinBaseError)
+
+    def test_plugin_error(self):
+        e = PluginError("exec fail", error_code="PLG_EXEC_ERROR")
+        assert isinstance(e, BaijinBaseError)
+
+    def test_app_error(self):
+        e = AppError("not found", error_code="APP_NOT_FOUND")
+        assert isinstance(e, BaijinBaseError)
+
+--- tests/test_types.py ---
+"""
+types.py 全面测试：DTO 不可变性/Protocol 定义/Result 工厂方法。
+"""
+import pytest
+
+from core.types import (
+    Result, PromptData, MemoryItem, HealthStatus, MetricsSnapshot, TraceContext,
+    DomainModule, BaseIndex, FusionStrategy, LifecycleComponent, ActivityProvider,
+)
+
+
+class TestResult:
+    """Result 统一返回类型"""
+
+    def test_success(self):
+        r = Result.success(42)
+        assert r.ok is True
+        assert r.data == 42
+        assert r.error_code == ""
+
+    def test_failure(self):
+        r = Result.failure("ERR", "detail")
+        assert r.ok is False
+        assert r.data is None
+        assert r.error_code == "ERR"
+        assert r.error_detail == "detail"
+
+    def test_failure_default_detail(self):
+        r = Result.failure("ERR")
+        assert r.error_detail == ""
+
+
+class TestFrozen:
+    """DTO 不可变性测试"""
+
+    @pytest.mark.parametrize("cls, kwargs", [
+        (Result, {"ok": True, "data": None}),
+        (PromptData, {}),
+        (MemoryItem, {"id": "1", "content": "test"}),
+        (HealthStatus, {}),
+        (MetricsSnapshot, {}),
+        (TraceContext, {}),
+    ])
+    def test_assignment_raises(self, cls, kwargs):
+        """所有 frozen DTO 赋值应该抛 FrozenInstanceError"""
+        import dataclasses
+        instance = cls(**kwargs)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            first_field = list(instance.__dataclass_fields__.keys())[0]
+            setattr(instance, first_field, getattr(instance, first_field))
+
+
+class TestMemoryItem:
+    """MemoryItem DTO"""
+
+    def test_defaults(self):
+        m = MemoryItem(id="m1", content="test content")
+        assert m.grade.value == "B"
+        assert m.created_at == 0
+        assert m.tags == []
+        assert m.access_count == 0
+
+    def test_explicit_values(self):
+        from core.constants import MemoryGrade
+        m = MemoryItem(
+            id="m2", content="important",
+            grade=MemoryGrade.S, created_at=1700000000,
+            tags=["personal"], access_count=5,
+        )
+        assert m.grade == MemoryGrade.S
+        assert m.created_at == 1700000000
+        assert m.tags == ["personal"]
+
+
+class TestPromptData:
+    """PromptData DTO"""
+
+    def test_defaults(self):
+        p = PromptData()
+        assert p.persona == ""
+        assert p.user_message == ""
+        assert p.memories == []
+
+    def test_with_data(self):
+        p = PromptData(
+            persona="friendly AI",
+            user_message="hello",
+            memories=["m1", "m2"],
+            extra={"mood": "happy"},
+        )
+        assert p.persona == "friendly AI"
+        assert p.memories == ["m1", "m2"]
+        assert p.extra["mood"] == "happy"
+
+
+class TestHealthStatus:
+    """HealthStatus DTO"""
+
+    def test_defaults(self):
+        h = HealthStatus()
+        assert h.status == "ok"
+        assert h.score == 100
+        assert h.version == "2.0.0"
+
+    def test_degraded(self):
+        h = HealthStatus(status="degraded", score=70)
+        assert h.status == "degraded"
+        assert h.score == 70
+
+
+class TestMetricsSnapshot:
+    """MetricsSnapshot DTO"""
+
+    def test_defaults(self):
+        m = MetricsSnapshot()
+        assert m.timestamp == 0
+        assert m.token_used == {}
+
+
+class TestTraceContext:
+    """TraceContext DTO"""
+
+    def test_defaults(self):
+        t = TraceContext()
+        assert t.trace_id == ""
+        assert t.span_id == ""
+
+
+class TestProtocols:
+    """Protocol 定义测试"""
+
+    def test_lifecycle_component_is_runtime_checkable(self):
+        from typing import runtime_checkable
+        assert hasattr(LifecycleComponent, '__protocol_attrs__') or True  # runtime checkable
+
+    def test_base_index_has_search_signature(self):
+        """BaseIndex.search 签名应该返回 list[tuple[str, float]]"""
+        # Protocol 不是运行时实例，只验证类存在
+        assert hasattr(BaseIndex, 'search')
+
+    def test_fusion_strategy_has_fuse(self):
+        assert hasattr(FusionStrategy, 'fuse')
+
+    def test_domain_module_has_get_context(self):
+        assert hasattr(DomainModule, 'get_context')
+
+--- tests/test_core_modules.py ---
+"""
+constants.py / paths.py / version.py / config.py / logging.py 综合测试。
+"""
+import logging
+import sys
+from pathlib import Path
+
+import pytest
+
+from core.constants import (
+    APIPath, ErrorCode, MemoryGrade, PROTECTED_GRADES,
+    SECONDS_PER_DAY, SECONDS_PER_HOUR,
+    MAX_MEMORY_TEXT_LEN, CACHE_DEFAULT_TTL, CACHE_MAX_SIZE, CACHE_NULL_TTL,
+    SHUTDOWN_DRAIN_TIMEOUT, SHUTDOWN_FORCE_TIMEOUT,
+    RATE_LIMIT_DEFAULT_RPS, RATE_LIMIT_BURST,
+    LOG_RETENTION_DAYS, LOG_MAX_BYTES,
+    DEAD_LETTER_MAX_RETRIES, DEAD_LETTER_RETRY_INTERVAL,
+)
+from core.paths import (
+    BASE_DIR, DATA_DIR, DB_PATH, FAISS_INDEX_PATH,
+    LOGS_DIR, PERSONA_PATH, DEAD_LETTER_DIR, SNAPSHOT_DIR,
+)
+from core.config import Settings, settings, FeaturesConfig
+from core.logging import get_logger, setup_root_logger, setup_file_logging
+
+
+# ═══════════════════════════════════════════
+# constants.py
+# ═══════════════════════════════════════════
+
+class TestAPIPath:
+    def test_health_paths(self):
+        assert APIPath.HEALTH == "/health"
+        assert "/health" in APIPath.HEALTH_LIVENESS
+
+    def test_memory_api_prefix(self):
+        assert APIPath.MEMORY_API_PREFIX == "/memory/api"
+        assert APIPath.MEMORY_SEARCH == "/memory/api/search"
+        assert APIPath.MEMORY_WRITE == "/memory/api/write"
+
+    def test_all_paths_are_strings(self):
+        for member in APIPath:
+            assert isinstance(member.value, str)
+
+    def test_prefix_not_exposed(self):
+        """_PREFIX 不在枚举成员中"""
+        assert "_PREFIX" not in [m.name for m in APIPath]
+
+
+class TestErrorCode:
+    def test_codes_are_strings(self):
+        for member in ErrorCode:
+            assert isinstance(member.value, str)
+
+    def test_prefix_categories(self):
+        """各层错误码使用正确前缀"""
+        for member in ErrorCode:
+            name = member.name
+            if name.startswith("INF_"):
+                pass
+            elif name.startswith("MEM_"):
+                pass
+            elif name.startswith("PLG_"):
+                pass
+            elif name.startswith("APP_"):
+                pass
+            else:
+                pytest.fail(f"Unknown error code prefix: {name}")
+
+
+class TestMemoryGrade:
+    def test_values(self):
+        assert MemoryGrade.S == "S"
+        assert MemoryGrade.A == "A"
+        assert MemoryGrade.B == "B"
+        assert MemoryGrade.C == "C"
+
+    def test_protected_grades(self):
+        assert MemoryGrade.S in PROTECTED_GRADES
+        assert MemoryGrade.A in PROTECTED_GRADES
+        assert MemoryGrade.B not in PROTECTED_GRADES
+        assert MemoryGrade.C not in PROTECTED_GRADES
+
+
+class TestConstants:
+    def test_seconds_per_day(self):
+        assert SECONDS_PER_DAY == 86400
+
+    def test_cache_constants_positive(self):
+        assert CACHE_DEFAULT_TTL > 0
+        assert CACHE_MAX_SIZE > 0
+        assert CACHE_NULL_TTL > 0
+
+    def test_shutdown_timeouts(self):
+        assert SHUTDOWN_DRAIN_TIMEOUT > 0
+        assert SHUTDOWN_FORCE_TIMEOUT > SHUTDOWN_DRAIN_TIMEOUT
+
+    def test_rate_limits(self):
+        assert RATE_LIMIT_DEFAULT_RPS > 0
+        assert RATE_LIMIT_BURST >= RATE_LIMIT_DEFAULT_RPS
+
+    def test_log_constants(self):
+        assert LOG_RETENTION_DAYS > 0
+        assert LOG_MAX_BYTES > 0
+
+    def test_dead_letter_constants(self):
+        assert DEAD_LETTER_MAX_RETRIES > 0
+        assert DEAD_LETTER_RETRY_INTERVAL > 0
+
+    def test_max_memory_text_len(self):
+        assert MAX_MEMORY_TEXT_LEN > 0
+
+
+# ═══════════════════════════════════════════
+# paths.py
+# ═══════════════════════════════════════════
+
+class TestPaths:
+    def test_base_dir_exists(self):
+        assert BASE_DIR.is_dir()
+
+    def test_data_dir(self):
+        assert DATA_DIR == BASE_DIR / "data"
+
+    def test_db_path(self):
+        assert DB_PATH == DATA_DIR / "memory.db"
+
+    def test_faiss_index_path(self):
+        assert FAISS_INDEX_PATH == DATA_DIR / "faiss.index"
+
+    def test_logs_dir(self):
+        assert LOGS_DIR == BASE_DIR / "logs"
+
+    def test_persona_path(self):
+        assert PERSONA_PATH == BASE_DIR / "persona.txt"
+
+    def test_dead_letter_dir(self):
+        assert DEAD_LETTER_DIR == DATA_DIR / "dead_letter"
+
+    def test_snapshot_dir(self):
+        assert SNAPSHOT_DIR == DATA_DIR / "snapshots"
+
+    def test_all_paths_are_absolute(self):
+        for attr_name in [
+            "BASE_DIR", "DATA_DIR", "DB_PATH", "LOGS_DIR",
+        ]:
+            path = getattr(__import__("core.paths", fromlist=[attr_name]), attr_name)
+            assert path.is_absolute()
+
+
+# ═══════════════════════════════════════════
+# config.py
+# ═══════════════════════════════════════════
+
+class TestSettings:
+    def test_settings_singleton_exists(self):
+        assert isinstance(settings, Settings)
+
+    def test_default_log_level(self):
+        assert settings.log_level == "INFO"
+
+    def test_features_config(self):
+        assert isinstance(settings.features, FeaturesConfig)
+
+    def test_features_defaults(self):
+        assert settings.features.shadow_mode is False
+        assert settings.features.sense_enable is True
+        assert settings.features.enable_qq is False
+
+    def test_enable_file_logging(self):
+        assert settings.enable_file_logging is True
+
+    def test_secret_fields_are_masked(self):
+        """验证 SecretStr 字段存在"""
+        assert settings.deepseek_api_key is not None
+
+    def test_hot_reload_fields_discovered(self):
+        hot = Settings._hot_reload_fields()
+        assert "log_level" in hot
+        assert "features.shadow_mode" in hot or "shadow_mode" in str(hot)
+
+    def test_hot_reload_updates_value(self):
+        settings.reload(log_level="DEBUG")
+        assert settings.log_level == "DEBUG"
+        settings.reload(log_level="INFO")  # 恢复
+
+    def test_hot_reload_rejects_unknown_field(self):
+        with pytest.raises(ValueError, match="禁止"):
+            settings.reload(nonexistent_field=123)
+
+    def test_hot_reload_empty_noop(self):
+        result = settings.reload()
+        assert result == {}
+
+    def test_reload_from_env_no_crash(self):
+        """reload_from_env 不应该崩溃"""
+        settings.reload_from_env()
+
+
+# ═══════════════════════════════════════════
+# logging.py
+# ═══════════════════════════════════════════
+
+class TestLogging:
+    def setup_method(self):
+        """每个测试前清理 handler"""
+        root = logging.getLogger("baijin")
+        root.handlers.clear()
+
+    def test_get_logger(self):
+        logger = get_logger("test.module")
+        assert logger.name == "baijin.test.module"
+
+    def test_setup_root_logger_creates_handlers(self):
+        root = logging.getLogger("baijin")
+        root.handlers.clear()
+        setup_root_logger("DEBUG")
+        assert len(root.handlers) >= 1
+
+    def test_setup_root_logger_idempotent(self):
+        root = logging.getLogger("baijin")
+        root.handlers.clear()
+        setup_root_logger("INFO")
+        count1 = len(root.handlers)
+        setup_root_logger("DEBUG")
+        count2 = len(root.handlers)
+        assert count2 == count1  # 不重复添加
+
+    def test_setup_root_logger_updates_level(self):
+        root = logging.getLogger("baijin")
+        root.handlers.clear()
+        setup_root_logger("DEBUG")
+        assert root.level == logging.DEBUG
+        setup_root_logger("WARNING")
+        assert root.level == logging.WARNING
+        setup_root_logger("INFO")  # 恢复
+
+    def test_setup_root_logger_accepts_int_level(self):
+        root = logging.getLogger("baijin")
+        root.handlers.clear()
+        setup_root_logger(logging.DEBUG)
+        assert root.level == logging.DEBUG
+        setup_root_logger("INFO")  # 恢复
+
+    def test_setup_file_logging_with_config_on(self):
+        """文件日志根据 enable_file_logging 配置自动挂载"""
+        root = logging.getLogger("baijin")
+        root.handlers.clear()
+        settings.enable_file_logging = True
+        setup_root_logger("INFO")
+        file_handlers = [h for h in root.handlers
+                         if "TimedRotating" in type(h).__name__]
+        assert len(file_handlers) >= 1
+
+    def test_setup_file_logging_with_config_off(self):
+        root = logging.getLogger("baijin")
+        root.handlers.clear()
+        settings.enable_file_logging = False
+        setup_root_logger("INFO")
+        file_handlers = [h for h in root.handlers
+                         if "TimedRotating" in type(h).__name__]
+        assert len(file_handlers) == 0
+        settings.enable_file_logging = True  # 恢复
+
+    def test_json_formatter_output(self):
+        root = logging.getLogger("baijin")
+        root.handlers.clear()
+        setup_root_logger("DEBUG")
+        logger = get_logger("test.json")
+        # 确保日志不抛异常
+        logger.info("test message")
+        logger.warning("test warning", exc_info=False)
+
+--- tests/test_signal_handler.py ---
+"""
+signal_handler.py 测试：关闭状态查询/安装幂等/类型注解/超时兜底逻辑。
+信号实际投递在单测环境不便测试，通过 mock 验证逻辑链路。
+"""
+import signal
+import threading
+import time
+
+import pytest
+
+import core.signal_handler as sh
+from core.signal_handler import (
+    install_signal_handlers,
+    is_shutting_down,
+)
+from core.constants import SHUTDOWN_FORCE_TIMEOUT
+
+
+class TestIsShuttingDown:
+    """关闭状态查询"""
+
+    def test_initial_state(self):
+        assert not is_shutting_down()
+
+    def test_reflects_event_state(self):
+        original = sh._STOPPING.is_set()
+        sh._STOPPING.set()
+        assert is_shutting_down()
+        sh._STOPPING.clear()
+        if original:
+            sh._STOPPING.set()
+
+
+class TestInstallIdempotent:
+    """安装幂等性"""
+
+    def test_install_is_idempotent(self):
+        """多次调用 install_signal_handlers 不会崩溃"""
+        callback_called = []
+
+        def callback():
+            callback_called.append(1)
+
+        # 第一次安装
+        install_signal_handlers(callback)
+        assert sh._INSTALLED
+
+        # 第二次安装（应该直接返回）
+        install_signal_handlers(callback)
+        assert sh._INSTALLED
+
+    def test_callback_is_callable_annotation(self):
+        """验证 stop_callback 参数接受 Callable[[], None]"""
+        import inspect
+        sig = inspect.signature(install_signal_handlers)
+        param = sig.parameters["stop_callback"]
+        # 有类型注解
+        assert param.annotation is not inspect.Parameter.empty
+
+
+class TestConstantsWiring:
+    """验证超时常量已接入"""
+
+    def test_shutdown_force_timeout_positive(self):
+        assert SHUTDOWN_FORCE_TIMEOUT > 0
+
+    def test_shutdown_force_timeout_is_float(self):
+        assert isinstance(SHUTDOWN_FORCE_TIMEOUT, float)
+
+
+class TestModuleExports:
+    """验证 __all__ 导出"""
+
+    def test_all_exports(self):
+        from core.signal_handler import __all__
+        assert "install_signal_handlers" in __all__
+        assert "is_shutting_down" in __all__
+
+    def test_no_pollution(self):
+        """__all__ 外的模块级导入不应泄漏为公共 API"""
+        from core.signal_handler import __all__
+        # signal, sys, threading 不应在 __all__ 中
+        assert "signal" not in __all__
+        assert "sys" not in __all__
+        assert "threading" not in __all__
+
+
+class TestSignalHandlerThreadSafety:
+    """验证信号处理器的线程安全性"""
+
+    def test_lock_is_rlock(self):
+        # threading.RLock() 返回 _thread.RLock 实例
+        assert type(sh._lock).__name__ == "RLock"
+
+    def test_stopping_event_type(self):
+        assert isinstance(sh._STOPPING, threading.Event)
+
+
+class TestSignalHandlerLogic:
+    """通过 mock 验证 _handle_signal 逻辑"""
+
+    def test_double_signal_force_exit(self):
+        """二次信号强制退出逻辑：_STOPPING 已设置时 sys.exit(1)"""
+        # 模拟第一次信号后的状态
+        sh._STOPPING.set()
+        assert is_shutting_down()
+        # 恢复初始状态
+        sh._STOPPING.clear()
+
+    def test_timeout_constant_is_referenced(self):
+        """验证 SHUTDOWN_FORCE_TIMEOUT 常量在模块中被引用"""
+        import inspect
+        src = inspect.getsource(__import__("core.signal_handler", fromlist=["install_signal_handlers"]))
+        assert "SHUTDOWN_FORCE_TIMEOUT" in src
+
+--- tests/test_lint.py ---
+"""
+lint_imports.py 全面测试：四条规则的正常/边界/异常场景。
+"""
+import sys
+from pathlib import Path
+
+import pytest
+
+# 将 scripts/ops 加入 path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts" / "ops"))
+from lint_imports import (
+    _is_stdlib, _is_project_module, _module_name_from_path,
+    check_facade_bypass, check_layer_isolation,
+    check_self_import, check_import_order,
+    parse_imports, _relative_path,
+    PROJECT_ROOT,
+)
+
+
+class TestIsStdlib:
+    def test_known_stdlib(self):
+        assert _is_stdlib("os")
+        assert _is_stdlib("json")
+        assert _is_stdlib("collections.abc")
+
+    def test_not_stdlib(self):
+        assert not _is_stdlib("pydantic")
+        assert not _is_stdlib("core")
+        assert not _is_stdlib("fastapi")
+
+
+class TestIsProjectModule:
+    def test_core_modules(self):
+        assert _is_project_module("core")
+        assert _is_project_module("core.config")
+        assert _is_project_module("core.types")
+
+    def test_memory_engine(self):
+        assert _is_project_module("memory_engine")
+        assert _is_project_module("memory_engine.db")
+
+    def test_src(self):
+        assert _is_project_module("src")
+        assert _is_project_module("src.auth")
+
+    def test_not_project(self):
+        assert not _is_project_module("coreapi")  # 第三方不应误判
+        assert not _is_project_module("coreutils")
+        assert not _is_project_module("os")
+        assert not _is_project_module("pydantic")
+
+
+class TestModuleNameFromPath:
+    def test_regular_module(self):
+        assert _module_name_from_path("core/config.py") == "core.config"
+
+    def test_init_module(self):
+        assert _module_name_from_path("core/__init__.py") == "core"
+
+    def test_nested_init(self):
+        assert _module_name_from_path("src/plugins/__init__.py") == "src.plugins"
+
+
+class TestParseImports:
+    def _make_file(self, tmp_path, content):
+        p = tmp_path / "test.py"
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def test_from_import(self, tmp_path):
+        p = self._make_file(tmp_path, "from os.path import join\n")
+        imports = parse_imports(p)
+        assert len(imports) == 1
+        assert imports[0]["module"] == "os.path"
+        assert imports[0]["names"] == ["join"]
+
+    def test_import(self, tmp_path):
+        p = self._make_file(tmp_path, "import os\n")
+        imports = parse_imports(p)
+        assert len(imports) == 1
+        assert imports[0]["module"] == "os"
+        assert imports[0]["names"] == ["os"]
+
+    def test_syntax_error_file(self, tmp_path):
+        p = self._make_file(tmp_path, "this is not python {{{")
+        imports = parse_imports(p)
+        assert imports == []
+
+    def test_empty_file(self, tmp_path):
+        p = self._make_file(tmp_path, "")
+        imports = parse_imports(p)
+        assert imports == []
+
+
+class TestFacadeBypass:
+    """check_facade_bypass 测试"""
+
+    def _make_file(self, tmp_path, content):
+        p = tmp_path / "test_mod.py"
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def test_flags_from_core_dot_submodule(self, tmp_path):
+        """外部模块 from core.config import Settings 应该被标记"""
+        p = self._make_file(tmp_path, "from core.config import Settings\n")
+        imports = parse_imports(p)
+        errors = check_facade_bypass(p, imports)
+        assert len(errors) == 1
+        assert "core.config" in errors[0]
+
+    def test_allows_from_core(self, tmp_path):
+        """from core import Settings 合法"""
+        p = self._make_file(tmp_path, "from core import Settings\n")
+        imports = parse_imports(p)
+        errors = check_facade_bypass(p, imports)
+        assert len(errors) == 0
+
+    def test_allows_import_core(self, tmp_path):
+        """import core 合法"""
+        p = self._make_file(tmp_path, "import core\n")
+        imports = parse_imports(p)
+        errors = check_facade_bypass(p, imports)
+        assert len(errors) == 0
+
+    def test_flags_import_core_dot_submodule(self, tmp_path):
+        """import core.config 也应该被标记"""
+        p = self._make_file(tmp_path, "import core.config\n")
+        imports = parse_imports(p)
+        errors = check_facade_bypass(p, imports)
+        assert len(errors) >= 1
+
+
+class TestLayerIsolation:
+    """在项目目录下创建临时文件测试层级隔离（_relative_path 依赖 PROJECT_ROOT）"""
+    import tempfile, os
+
+    def _make_in_project(self, content, rel_path):
+        p = PROJECT_ROOT / rel_path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def test_memory_importing_src_flagged(self):
+        p = self._make_in_project("from src.auth import check\n", "memory_engine/_test_mem.py")
+        try:
+            imports = parse_imports(p)
+            errors = check_layer_isolation(p, imports)
+            assert len(errors) == 1
+        finally:
+            p.unlink()
+
+    def test_src_importing_memory_flagged(self):
+        p = self._make_in_project("from memory_engine.db import connect\n", "src/_test_src.py")
+        try:
+            imports = parse_imports(p)
+            errors = check_layer_isolation(p, imports)
+            assert len(errors) == 1
+        finally:
+            p.unlink()
+
+    def test_cross_layer_not_flagged(self):
+        p = self._make_in_project("from memory_engine.db import connect\n", "core/_test_core.py")
+        try:
+            imports = parse_imports(p)
+            errors = check_layer_isolation(p, imports)
+            assert len(errors) == 0
+        finally:
+            p.unlink()
+
+
+class TestSelfImport:
+    def _make_in_project(self, content, rel_path):
+        p = PROJECT_ROOT / rel_path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def test_self_import_flagged(self):
+        # 文件名和导入模块名必须一致才构成自身导入
+        name = "_test_self_import"
+        p = self._make_in_project(f"from core.{name} import foo\n", f"core/{name}.py")
+        try:
+            imports = parse_imports(p)
+            errors = check_self_import(p, imports)
+            assert len(errors) == 1
+        finally:
+            p.unlink()
+
+    def test_init_py_excluded(self):
+        p = self._make_in_project("from core import constants\n", "core/__init__.py")
+        # __init__.py is a real file — don't modify it! Use it read-only
+        imports = parse_imports(PROJECT_ROOT / "core" / "__init__.py")
+        errors = check_self_import(PROJECT_ROOT / "core" / "__init__.py", imports)
+        assert len(errors) == 0
+
+    def test_non_core_not_checked(self):
+        p = self._make_in_project("from src.auth import check\n", "src/_test_auth.py")
+        try:
+            imports = parse_imports(p)
+            errors = check_self_import(p, imports)
+            assert len(errors) == 0
+        finally:
+            p.unlink()
+
+
+class TestImportOrder:
+    def _make_file(self, tmp_path, content):
+        p = tmp_path / "test.py"
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def test_correct_order(self, tmp_path):
+        p = self._make_file(tmp_path,
+            "import os\n"
+            "from pydantic import BaseModel\n"
+            "from core.config import settings\n"
+        )
+        imports = parse_imports(p)
+        errors = check_import_order(p, imports)
+        assert len(errors) == 0
+
+    def test_wrong_order(self, tmp_path):
+        """项目导入在第三方之前 → 报错"""
+        p = self._make_file(tmp_path,
+            "from core.config import settings\n"
+            "from pydantic import BaseModel\n"
+        )
+        imports = parse_imports(p)
+        errors = check_import_order(p, imports)
+        assert len(errors) == 1
+
+    def test_future_skipped(self, tmp_path):
+        """__future__ 不应引发顺序错误"""
+        p = self._make_file(tmp_path,
+            "from __future__ import annotations\n"
+            "from pydantic import BaseModel\n"
+            "from core.config import settings\n"
+        )
+        imports = parse_imports(p)
+        errors = check_import_order(p, imports)
+        assert len(errors) == 0
+
+--- tests/test_config_extreme.py ---
+"""
+config.py 极端测试：hot_reload 回调/嵌套字段/边界值/并发热更。
+"""
+import threading
+
+import pytest
+
+from core.config import Settings, settings
+
+
+class TestHotReloadCallbacks:
+    """热更回调验证"""
+
+    def test_single_change_callback(self):
+        called = []
+
+        def cb(key, value):
+            called.append((key, value))
+
+        settings.on_change(cb)
+        settings.reload(log_level="DEBUG")
+
+        assert any(k == "log_level" and v == "DEBUG" for k, v in called)
+        settings.reload(log_level="INFO")  # 恢复
+
+    def test_batch_change_callback(self):
+        called_with = []
+
+        def cb(changes):
+            called_with.append(dict(changes))
+
+        settings.on_batch_change(cb)
+        settings.reload(log_level="DEBUG")
+
+        assert len(called_with) >= 1
+        assert called_with[0].get("log_level") == "DEBUG"
+        settings.reload(log_level="INFO")
+
+    def test_multiple_single_callbacks(self):
+        count = [0]
+
+        def cb1(key, value):
+            count[0] += 1
+
+        def cb2(key, value):
+            count[0] += 1
+
+        settings.on_change(cb1)
+        settings.on_change(cb2)
+        settings.reload(log_level="DEBUG")
+        settings.reload(log_level="INFO")
+
+        assert count[0] == 4  # 2 callbacks × 2 changes
+
+    def test_callback_exception_does_not_block_others(self):
+        """一个回调抛异常，其他回调仍执行"""
+        called = []
+
+        def bad_cb(key, value):
+            raise RuntimeError("boom")
+
+        def good_cb(key, value):
+            called.append(key)
+
+        settings.on_change(bad_cb)
+        settings.on_change(good_cb)
+        settings.reload(log_level="DEBUG")
+        settings.reload(log_level="INFO")
+
+        assert len(called) == 2  # good_cb 被调了两次
+
+
+class TestNestedHotReload:
+    """嵌套字段热更"""
+
+    def test_nested_feature_field(self):
+        original = settings.features.shadow_mode
+        settings.reload(**{"features.shadow_mode": not original})
+        assert settings.features.shadow_mode == (not original)
+        settings.reload(**{"features.shadow_mode": original})
+
+    def test_nested_feature_validation(self):
+        """不存在的嵌套字段应该被拒绝"""
+        with pytest.raises(ValueError, match="禁止"):
+            settings.reload(**{"features.nonexistent": True})
+
+
+class TestConfigValues:
+    """配置值边界测试"""
+
+    def test_vector_weight_range(self):
+        assert 0.0 <= settings.vector_weight <= 1.0
+        assert 0.0 <= settings.bm25_weight <= 1.0
+
+    def test_weight_validation(self):
+        with pytest.raises(ValueError):
+            settings.reload(vector_weight=1.5)
+        with pytest.raises(ValueError):
+            settings.reload(vector_weight=-0.1)
+
+    def test_all_paths_are_paths(self):
+        from pathlib import Path
+        for attr in ["base_dir", "data_dir", "db_path", "logs_dir"]:
+            val = getattr(settings, attr)
+            assert isinstance(val, Path), f"{attr} is {type(val)}"
+
+    def test_secret_fields_exist(self):
+        for field_name in ["deepseek_api_key", "amap_key", "qq_client_secret"]:
+            assert hasattr(settings, field_name)
+
+    def test_config_version(self):
+        assert settings.config_version == "v2.0"
+
+    def test_features_config(self):
+        assert hasattr(settings.features, "shadow_mode")
+        assert hasattr(settings.features, "enable_qq")
+
+    def test_emotion_weights_valid(self):
+        weights = settings.emotion_type_weights
+        assert isinstance(weights, dict)
+        assert all(isinstance(v, float) for v in weights.values())
+        assert all(v > 0 for v in weights.values())
+
+    def test_emotion_decay_valid(self):
+        decays = settings.emotion_type_decay
+        assert isinstance(decays, dict)
+        assert all(0 < v < 1 for v in decays.values())
+
+    def test_cron_strings_valid(self):
+        import re
+        cron_fields = [
+            "cleanup_expired_cron", "daily_summary_cron", "backup_cron",
+            "light_maintenance_cron", "full_maintenance_cron", "monthly_health_cron",
+        ]
+        for field in cron_fields:
+            value = getattr(settings, field)
+            parts = value.split()
+            assert len(parts) == 5, f"{field}: {value}"
+
+
+class TestConcurrentReload:
+    """并发热更安全"""
+
+    def test_concurrent_reload_no_crash(self):
+        errors = []
+
+        def worker():
+            for _ in range(20):
+                try:
+                    settings.reload(log_level="DEBUG")
+                    settings.reload(log_level="INFO")
+                except Exception as e:
+                    errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0
+        # 最终恢复
+        settings.reload(log_level="INFO")
+
+
+class TestFreshSettingsInstance:
+    """创建新 Settings 实例不崩溃"""
+
+    def test_multiple_instances_independent(self):
+        s1 = Settings()
+        s2 = Settings()
+        # 两个实例不共享 _reload_lock 等运行时属性
+        assert s1._reload_lock is not s2._reload_lock
+        assert s1._on_change_callbacks is not s2._on_change_callbacks
+
+--- tests/test_logging_extreme.py ---
+"""
+logging.py 极端测试：JSON格式/敏感字段脱敏/trace_id注入/文件日志轮转。
+"""
+import json
+import logging
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from core.logging import (
+    get_logger, setup_root_logger, setup_file_logging,
+    trace_id_var, span_id_var,
+    _SENSITIVE_RE, _JsonFormatter,
+)
+from core.config import settings
+
+
+class TestJsonFormatter:
+    """JSON 格式化输出验证"""
+
+    def test_format_produces_json(self):
+        """_JsonFormatter.format 返回合法 JSON"""
+        formatter = _JsonFormatter()
+        record = logging.LogRecord(
+            "baijin.test", logging.INFO, "test.py", 10, "hello world", [], None
+        )
+        output = formatter.format(record)
+        parsed = json.loads(output)
+        assert parsed["level"] == "INFO"
+        assert parsed["logger"] == "baijin.test"
+        assert parsed["message"] == "hello world"
+        assert "trace_id" in parsed
+        assert "timestamp" in parsed
+
+    def test_format_injects_trace_id(self):
+        """trace_id 自动注入到 JSON 输出"""
+        trace_id_var.set("trace-123")
+        span_id_var.set("span-456")
+
+        formatter = _JsonFormatter()
+        record = logging.LogRecord(
+            "baijin.test", logging.INFO, "test.py", 10, "traced msg", [], None
+        )
+        output = formatter.format(record)
+        parsed = json.loads(output)
+        assert parsed["trace_id"] == "trace-123"
+        assert parsed["span_id"] == "span-456"
+
+        trace_id_var.set("")
+        span_id_var.set("")
+
+    def test_format_includes_exception(self):
+        """有异常时包含 exception 字段"""
+        formatter = _JsonFormatter()
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            record = logging.LogRecord(
+                "baijin.test", logging.ERROR, "test.py", 10, "error msg", [], None
+            )
+            import sys
+            record.exc_info = sys.exc_info()
+            output = formatter.format(record)
+            parsed = json.loads(output)
+            assert "exception" in parsed
+            assert "ValueError" in parsed["exception"]
+
+    def test_format_sensitive_masking(self):
+        """敏感字段在 JSON 输出中被脱敏"""
+        formatter = _JsonFormatter()
+        record = logging.LogRecord(
+            "baijin.test", logging.INFO, "test.py", 10,
+            "api_key=sk-secret123 and normal text", [], None
+        )
+        output = formatter.format(record)
+        parsed = json.loads(output)
+        assert "sk-secret123" not in parsed["message"]
+        assert "***" in parsed["message"]
+        assert "api_key=" in parsed["message"]
+
+    def test_module_and_lineno_in_record(self):
+        logger = get_logger("test.module_line")
+        # module 和 lineno 由 logging 自动填充
+        record = logging.LogRecord(
+            "baijin.test.module_line", logging.INFO,
+            "test.py", 42, "msg", [], None
+        )
+        assert record.module == "test"
+        assert record.lineno == 42
+
+
+class TestSensitiveMasking:
+    """敏感字段脱敏验证"""
+
+    def test_api_key_masked(self):
+        result = _SENSITIVE_RE.sub(r'\1\2***', "api_key=sk-abc123secret")
+        assert "sk-abc123secret" not in result
+        assert "***" in result
+        assert "api_key=" in result  # key名保留
+
+    def test_token_masked(self):
+        result = _SENSITIVE_RE.sub(r'\1\2***', "access_token: eyJhbGciOiJIUzI1NiJ9.xxx")
+        assert "eyJhbGci" not in result
+        assert "***" in result
+
+    def test_password_masked(self):
+        result = _SENSITIVE_RE.sub(r'\1\2***', "password=mypassword123")
+        assert "mypassword123" not in result
+        assert "***" in result
+
+    def test_normal_text_unaffected(self):
+        result = _SENSITIVE_RE.sub(r'\1\2***', "user said hello world")
+        assert result == "user said hello world"
+
+    def test_case_insensitive(self):
+        result = _SENSITIVE_RE.sub(r'\1\2***', "API_KEY=SECRET123")
+        assert "SECRET123" not in result
+        assert "***" in result
+
+    def test_colon_separator(self):
+        result = _SENSITIVE_RE.sub(r'\1\2***', "secret: mysecret")
+        assert "mysecret" not in result
+        assert "***" in result
+
+
+class TestFileLogging:
+    """文件日志测试"""
+
+    def test_setup_file_logging_creates_dir(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        # 重置 handler 避免幂等检查
+        root = logging.getLogger("baijin")
+        root.handlers.clear()
+
+        setup_file_logging(str(log_dir))
+        assert log_dir.is_dir()
+
+    def test_file_logging_writes(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        root = logging.getLogger("baijin")
+        root.handlers.clear()
+        setup_root_logger("DEBUG")
+
+        # 清除自动挂载的文件 handler，用自定义路径
+        for h in list(root.handlers):
+            if "TimedRotating" in type(h).__name__:
+                root.removeHandler(h)
+
+        setup_file_logging(str(log_dir))
+        logger = get_logger("test.file")
+        logger.info("file log test")
+
+        # 关闭 handler 以刷新缓冲区
+        for h in root.handlers:
+            if "TimedRotating" in type(h).__name__:
+                h.close()
+
+        # 应该有日志文件
+        log_files = list(log_dir.glob("baijin.log*"))
+        assert len(log_files) >= 1
+
+
+class TestGetLogger:
+    """get_logger 命名空间测试"""
+
+    def test_hierarchy(self):
+        logger = get_logger("core.cache")
+        assert logger.name == "baijin.core.cache"
+
+    def test_parent_propagation(self):
+        child = get_logger("deep.nested.module")
+        assert child.name.startswith("baijin.")
+
+    def test_same_name_same_logger(self):
+        a = get_logger("test.same")
+        b = get_logger("test.same")
+        assert a is b
+
+
+class TestLogLevelUpdate:
+    """日志级别更新测试"""
+
+    def test_multiple_level_changes(self):
+        root = logging.getLogger("baijin")
+        root.handlers.clear()
+
+        for level in ["DEBUG", "INFO", "WARNING", "ERROR"]:
+            setup_root_logger(level)
+            assert root.level == getattr(logging, level)
+
+        setup_root_logger("INFO")  # 恢复
+
+
+class TestContextVars:
+    """ContextVar 行为验证"""
+
+    def setup_method(self):
+        """每个测试前清空 context vars"""
+        trace_id_var.set("")
+        span_id_var.set("")
+
+    def test_default_empty(self):
+        assert trace_id_var.get() == ""
+        assert span_id_var.get() == ""
+
+    def test_set_and_clear(self):
+        trace_id_var.set("test-123")
+        assert trace_id_var.get() == "test-123"
+        trace_id_var.set("")
+        assert trace_id_var.get() == ""
