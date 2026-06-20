@@ -48,10 +48,10 @@ jobs:
       - name: Compile Python source
         run: python -m compileall -q .
 
-       - name: Check undefined names (temporarily non-blocking)
+      - name: Check undefined names temporarily
         continue-on-error: true
-        run: >
-          ruff check .
-          --target-version py312
-          --select E9,F63,F7,F82
-          --output-format github
+        run: |
+          ruff check . \
+            --target-version py312 \
+            --select E9,F63,F7,F82 \
+            --output-format github
