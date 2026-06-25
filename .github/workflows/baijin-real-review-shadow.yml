@@ -1,0 +1,311 @@
+name: baijin/real-review-shadow
+
+on:
+  push:
+    branches:
+      - dev
+    paths:
+      - review.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  checks: read
+  pull-requests: read
+
+env:
+  CI: "true"
+  GOVERNANCE_SHA: d640c388e7fcdf96b6e750d14994950fc7be50dc
+
+jobs:
+  prepare-real-review-gate-input:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      expected_policy_result: ${{ steps.set-expected.outputs.result }}
+    steps:
+      - name: Checkout xinbaijin
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+
+      - name: Generate Baijin reader app token
+        id: baijin-reader-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          app-id: ${{ vars.BAIJIN_GOVERNANCE_READER_APP_ID }}
+          private-key: ${{ secrets.BAIJIN_GOVERNANCE_READER_PRIVATE_KEY }}
+          owner: shunhang776
+          repositories: |
+            xinbaijin-governance
+            xinbaijin
+
+      - name: Checkout governance at pinned SHA
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: shunhang776/xinbaijin-governance
+          ref: ${{ env.GOVERNANCE_SHA }}
+          path: governance
+          token: ${{ steps.baijin-reader-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 22
+
+      - name: Install governance dependencies
+        working-directory: governance
+        run: npm ci
+
+      - name: Build real review gate-input
+        env:
+          GH_TOKEN: ${{ steps.baijin-reader-token.outputs.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          REVIEW_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          cat > "$GITHUB_WORKSPACE/build-real-review-gate-input.mjs" << 'SCRIPTEOF'
+          import { readFileSync, writeFileSync } from "node:fs";
+          import { createHash } from "node:crypto";
+          import { execSync } from "node:child_process";
+          import { normalizeCheckRuns } from "./governance/src/github/checks-normalizer.mjs";
+          import { buildGateInput as buildCoreGateInput } from "./governance/src/build-gate-input.mjs";
+
+          const reviewCommit = process.env.REVIEW_COMMIT;
+          const repo = process.env.GITHUB_REPOSITORY;
+          console.log("Review commit:", reviewCommit);
+
+          // 1. Verify single-parent commit
+          const parentLine = execSync("git show -s --format=%P " + reviewCommit, {
+            encoding: "utf8"
+          }).trim();
+
+          const parents = parentLine ? parentLine.split(/\s+/).filter(Boolean) : [];
+          const parentCount = parents.length;
+
+          if (parentCount !== 1) {
+            console.error("FATAL: must have exactly 1 parent, got " + parentCount);
+            process.exit(1);
+          }
+
+          const parentSha = parents[0];
+          console.log("Parent commit:", parentSha);
+
+          // 2. Verify only review.json was changed
+          const changedFiles = execSync(
+            "git diff-tree --no-commit-id --name-only -r " + reviewCommit,
+            { encoding: "utf8" }
+          ).trim().split("\n").filter(Boolean);
+          console.log("Changed files:", changedFiles);
+          if (changedFiles.length !== 1 || changedFiles[0] !== "review.json") {
+            console.error("FATAL: must modify exactly review.json");
+            process.exit(1);
+          }
+
+          // 3. Read review.json as raw bytes
+          let rawBytes;
+          try { rawBytes = readFileSync("review.json"); }
+          catch (err) {
+            console.error("FATAL: cannot read review.json:", err.message);
+            process.exit(1);
+          }
+          const rawContent = rawBytes.toString("utf8");
+
+          // 4. Parse and validate review.json
+          let review;
+          try { review = JSON.parse(rawContent); }
+          catch (err) {
+            console.error("FATAL: not valid JSON:", err.message);
+            process.exit(1);
+          }
+
+          const requiredFields = ["protocol", "repository", "branch",
+            "reviewed_commit", "based_on_branch_head", "verdict", "findings"];
+          for (const field of requiredFields) {
+            if (!(field in review)) {
+              console.error("FATAL: missing required field: " + field);
+              process.exit(1);
+            }
+          }
+          if (review.repository !== "shunhang776/xinbaijin") {
+            console.error("FATAL: repository mismatch");
+            process.exit(1);
+          }
+          if (review.branch !== "dev") {
+            console.error("FATAL: branch must be dev");
+            process.exit(1);
+          }
+          if (!/^[0-9a-f]{40}$/.test(review.reviewed_commit)) {
+            console.error("FATAL: reviewed_commit not 40-char hex");
+            process.exit(1);
+          }
+          if (!/^[0-9a-f]{40}$/.test(review.based_on_branch_head)) {
+            console.error("FATAL: based_on_branch_head not 40-char hex");
+            process.exit(1);
+          }
+          const validVerdicts = ["approved", "changes_requested", "blocked"];
+          if (!validVerdicts.includes(review.verdict)) {
+            console.error("FATAL: invalid verdict: " + review.verdict);
+            process.exit(1);
+          }
+          console.log("Review valid. Verdict:", review.verdict);
+
+          // 5. Determine line ending
+          let lineEnding = "lf";
+          const hasCRLF = rawContent.includes("\r\n");
+          const hasBareCR = rawContent.replace(/\r\n/g, "").includes("\r");
+          if (hasCRLF && hasBareCR) {
+            lineEnding = "mixed";
+          } else if (hasCRLF) {
+            lineEnding = "crlf";
+          } else if (rawContent.includes("\r")) {
+            lineEnding = "mixed";
+          } else if (!rawContent.includes("\n")) {
+            lineEnding = "none";
+          }
+          const hasTrailingNewline = rawContent.endsWith("\n");
+
+          // 6. Construct readback with real git metadata
+          const gitBlobSha = execSync("git rev-parse HEAD:review.json",
+            { encoding: "utf8" }).trim();
+          const sha256hash = createHash("sha256").update(rawBytes).digest("hex");
+
+          const readback = Object.freeze({
+            protocol: "xinbaijin-file/1.0",
+            repository: "shunhang776/xinbaijin",
+            ref: reviewCommit,
+            path: "review.json",
+            encoding: "utf-8",
+            github_blob_sha: gitBlobSha,
+            sha256: sha256hash,
+            byte_length: rawBytes.byteLength,
+            has_trailing_newline: hasTrailingNewline,
+            line_ending: lineEnding,
+            content: rawContent,
+            parsed_review: review,
+            integrity_verified: true
+          });
+
+          // 7. Verify candidate reachability
+          let reachable = false;
+          try {
+            execSync("git merge-base --is-ancestor " +
+              review.based_on_branch_head + " " + review.reviewed_commit,
+              { encoding: "utf8" });
+            reachable = true;
+          } catch {
+            console.error("FATAL: reviewed_commit not reachable from based_on_branch_head");
+            process.exit(1);
+          }
+          console.log("Reachability verified");
+
+          // 8. Fetch check runs for reviewed_commit
+          const candidateCommit = review.reviewed_commit;
+          let rawChecks = [];
+          try {
+            const checksJson = execSync(
+              "gh api repos/" + repo + "/commits/" + candidateCommit +
+              "/check-runs --jq \".check_runs\"",
+              { encoding: "utf8", timeout: 15000 }
+            ).trim();
+            if (checksJson && checksJson !== "null") {
+              rawChecks = JSON.parse(checksJson);
+              console.log("Fetched " + rawChecks.length + " check run(s)");
+            }
+          } catch (err) {
+            console.log("Could not fetch check runs:", err.message);
+          }
+
+          // Map GitHub head_sha to commit_sha for governance normalizer
+          const checksForGovernance = rawChecks.map(function(c) {
+            return Object.assign({}, c, {
+              commit_sha: c.commit_sha || c.head_sha
+            });
+          });
+
+          const normalizedChecks = normalizeCheckRuns(checksForGovernance);
+          const matchingChecks = normalizedChecks.filter(function(c) {
+            return c.commit_sha === candidateCommit;
+          });
+          console.log("Check runs matching candidate: " + matchingChecks.length);
+
+          const requiredCheckNames = matchingChecks.length > 0
+            ? [...new Set(matchingChecks.map(function(c) { return c.name; }))]
+            : ["baijin/build-test"];
+
+          // 9. Assemble evidence and build gate-input
+          const evidence = {
+            repository_key: "xinbaijin",
+            branch: "dev",
+            candidate_commit: candidateCommit,
+            submission_base_head: review.based_on_branch_head,
+            candidate_reachable_from_submission_base: reachable,
+            review_commit: reviewCommit,
+            review_commit_parent_sha: parentSha,
+            review_commit_changed_files: ["review.json"],
+            current_branch_head: reviewCommit,
+            required_check_names: requiredCheckNames,
+            required_checks: matchingChecks,
+            review: review,
+            readback: readback,
+            repair_round: 0
+          };
+
+          const gateInput = buildCoreGateInput(evidence);
+          writeFileSync("gate-input.json",
+            JSON.stringify(gateInput, null, 2) + "\n", "utf8");
+          console.log("gate-input.json written");
+          SCRIPTEOF
+
+          node "$GITHUB_WORKSPACE/build-real-review-gate-input.mjs"
+
+      - name: Set expected policy result
+        id: set-expected
+        run: |
+          set -euo pipefail
+          VERDICT=$(node -pe "JSON.parse(require('fs').readFileSync('review.json','utf8')).verdict")
+          if [ "$VERDICT" = "approved" ]; then
+            echo "result=allowed" >> "$GITHUB_OUTPUT"
+            echo "Expected policy: allowed (review approved)"
+          else
+            echo "result=denied" >> "$GITHUB_OUTPUT"
+            echo "Expected policy: denied (verdict=$VERDICT)"
+          fi
+
+      - name: Validate gate-input schema
+        working-directory: governance
+        run: node scripts/validate-gate-input.mjs ../gate-input.json
+
+      - name: Upload gate-input artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: real-review-gate-input
+          path: gate-input.json
+          retention-days: 1
+
+      - name: Log shadow notice
+        run: |
+          echo "================================================================"
+          echo "This is a non-blocking shadow smoke check."
+          echo "It does not approve code."
+          echo "It does not write review.json."
+          echo "It is not a Required Check."
+          echo "================================================================"
+
+  real-review-shadow-gate:
+    needs:
+      - prepare-real-review-gate-input
+    uses: shunhang776/xinbaijin-governance/.github/workflows/reusable-final-gate-shadow.yml@d640c388e7fcdf96b6e750d14994950fc7be50dc
+    with:
+      gate_input_artifact_name: real-review-gate-input
+      expected_policy_result: ${{ needs.prepare-real-review-gate-input.outputs.expected_policy_result }}
+      governance_ref: d640c388e7fcdf96b6e750d14994950fc7be50dc
+      github_app_id: ${{ vars.BAIJIN_GOVERNANCE_READER_APP_ID }}
+    secrets:
+      github_app_private_key: ${{ secrets.BAIJIN_GOVERNANCE_READER_PRIVATE_KEY }}
+    permissions:
+      contents: read
+      actions: read
