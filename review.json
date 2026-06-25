@@ -1,0 +1,12 @@
+{
+  "protocol": "xinbaijin-review/1.0",
+  "repository": "shunhang776/xinbaijin",
+  "branch": "dev",
+  "reviewed_commit": "986a382eff7cee3984a530653b955a73782c1e4d",
+  "based_on_branch_head": "986a382eff7cee3984a530653b955a73782c1e4d",
+  "verdict": "approved",
+  "summary": "已审查提交 986a382eff7cee3984a530653b955a73782c1e4d。本次变更新增 docs/PHASE3C-REAL-REVIEW-SMOKE.md，用于产生非 review.json 的文档提交，以测试 xinbaijin 主仓真实 ChatGPT review -> review.json -> real-review-shadow 流程。变更仅为文档说明，不涉及生产逻辑、业务代码、权限、Required Checks、生产门禁、跨仓库读写、stale review 保护、fast-forward 或分支头并发保护。未发现需要阻塞的问题。",
+  "findings": [],
+  "reviewer": "ChatGPT",
+  "reviewed_at": "2026-06-25T14:58:04.127Z"
+}
