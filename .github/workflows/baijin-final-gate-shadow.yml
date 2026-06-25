@@ -1,0 +1,224 @@
+name: baijin/final-gate-shadow
+
+on:
+  pull_request:
+    branches:
+      - dev
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+permissions:
+  contents: read
+  actions: read
+  checks: read
+  pull-requests: read
+
+env:
+  CI: "true"
+  GOVERNANCE_SHA: d640c388e7fcdf96b6e750d14994950fc7be50dc
+
+jobs:
+  prepare-gate-input:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout xinbaijin
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Generate Baijin reader app token
+        id: baijin-reader-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          app-id: ${{ vars.BAIJIN_GOVERNANCE_READER_APP_ID }}
+          private-key: ${{ secrets.BAIJIN_GOVERNANCE_READER_PRIVATE_KEY }}
+          owner: shunhang776
+          repositories: |
+            xinbaijin-governance
+            xinbaijin
+
+      - name: Checkout governance at pinned SHA
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: shunhang776/xinbaijin-governance
+          ref: ${{ env.GOVERNANCE_SHA }}
+          path: governance
+          token: ${{ steps.baijin-reader-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 22
+
+      - name: Install governance dependencies
+        working-directory: governance
+        run: npm ci
+
+      - name: Build shadow gate-input
+        env:
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ steps.baijin-reader-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          cat > "$GITHUB_WORKSPACE/build-shadow-gate-input.mjs" << 'SCRIPTEOF'
+          import { readFileSync, writeFileSync } from "node:fs";
+          import { createHash } from "node:crypto";
+          import { normalizePullRequestEvent } from "./governance/src/github/actions-event.mjs";
+          import { normalizeCheckRuns } from "./governance/src/github/checks-normalizer.mjs";
+          import { buildGateInput as buildCoreGateInput } from "./governance/src/build-gate-input.mjs";
+
+          const eventPath = process.env.GITHUB_EVENT_PATH;
+          if (!eventPath) {
+            console.error("FATAL: GITHUB_EVENT_PATH is not set");
+            process.exit(1);
+          }
+          const rawEvent = JSON.parse(readFileSync(eventPath, "utf8"));
+          const event = normalizePullRequestEvent(rawEvent);
+          console.log("Normalized event:", JSON.stringify(event, null, 2));
+
+          const candidateCommit = event.headSha;
+          console.log("Candidate commit:", candidateCommit);
+
+          const repo = process.env.GITHUB_REPOSITORY;
+          let rawChecks = [];
+          try {
+            const { execSync } = await import("node:child_process");
+            const checksJson = execSync(
+              `gh api repos/${repo}/commits/${candidateCommit}/check-runs --jq ".check_runs"`,
+              { encoding: "utf8", timeout: 15000 }
+            ).trim();
+            if (checksJson && checksJson !== "null") {
+              rawChecks = JSON.parse(checksJson);
+              console.log("Fetched " + rawChecks.length + " check run(s)");
+            } else {
+              console.log("No check runs for this commit");
+            }
+          } catch (err) {
+            console.log("Could not fetch check runs:", err.message);
+            console.log("Using empty check runs");
+          }
+
+          // Map GitHub check-runs head_sha to commit_sha for governance normalizer
+          const checksForGovernance = rawChecks.map((check) => ({
+            ...check,
+            commit_sha: check.commit_sha ?? check.head_sha
+          }));
+
+          const normalizedChecks = normalizeCheckRuns(checksForGovernance);
+          const matchingChecks = normalizedChecks.filter(
+            (c) => c.commit_sha === candidateCommit
+          );
+          console.log("Check runs matching candidate: " + matchingChecks.length);
+
+          const stubReview = Object.freeze({
+            protocol: "xinbaijin-review/1.0",
+            repository: "shunhang776/xinbaijin",
+            branch: "dev",
+            reviewed_commit: candidateCommit,
+            based_on_branch_head: event.baseSha,
+            verdict: "changes_requested",
+            summary: "Shadow stub review: no real ChatGPT review in Phase 2.",
+            findings: [{
+              severity: "info",
+              file: ".github/workflows/baijin-final-gate-shadow.yml",
+              line: 1,
+              title: "Shadow stub: awaiting Phase 3 real review",
+              description: "This stub ensures OPA denies (verdict=changes_requested). The denial confirms the shadow pipeline works.",
+              recommendation: "No action. This is a non-blocking shadow check."
+            }],
+            reviewer: "ChatGPT",
+            reviewed_at: new Date().toISOString().replace(/\.\d+Z$/, ".000Z")
+          });
+
+          const content = JSON.stringify(stubReview, null, 2) + "\n";
+          const bytes = Buffer.from(content, "utf8");
+          const reviewCommit = "ffffffffffffffffffffffffffffffffffffffff";
+
+          function sha256Utf8(s) {
+            return createHash("sha256").update(Buffer.from(s, "utf8")).digest("hex");
+          }
+
+          const stubReadback = Object.freeze({
+            protocol: "xinbaijin-file/1.0",
+            repository: "shunhang776/xinbaijin",
+            ref: reviewCommit,
+            path: "review.json",
+            encoding: "utf-8",
+            github_blob_sha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            sha256: sha256Utf8(content),
+            byte_length: bytes.byteLength,
+            has_trailing_newline: true,
+            line_ending: "lf",
+            content,
+            parsed_review: stubReview,
+            integrity_verified: true
+          });
+
+          const requiredCheckNames = matchingChecks.length > 0
+            ? [...new Set(matchingChecks.map((c) => c.name))]
+            : ["baijin/build-test"];
+
+          const evidence = {
+            repository_key: "xinbaijin",
+            branch: "dev",
+            candidate_commit: candidateCommit,
+            submission_base_head: event.baseSha,
+            candidate_reachable_from_submission_base: true,
+            review_commit: reviewCommit,
+            review_commit_parent_sha: event.baseSha,
+            review_commit_changed_files: ["review.json"],
+            current_branch_head: reviewCommit,
+            required_check_names: requiredCheckNames,
+            required_checks: matchingChecks,
+            review: stubReview,
+            readback: stubReadback,
+            repair_round: 0
+          };
+
+          const gateInput = buildCoreGateInput(evidence);
+          writeFileSync("gate-input.json", JSON.stringify(gateInput, null, 2) + "\n", "utf8");
+          console.log("gate-input.json written");
+          console.log("Expected policy: denied (stub verdict=changes_requested)");
+          SCRIPTEOF
+
+          node "$GITHUB_WORKSPACE/build-shadow-gate-input.mjs"
+
+      - name: Validate gate-input schema
+        working-directory: governance
+        run: node scripts/validate-gate-input.mjs ../gate-input.json
+
+      - name: Upload gate-input artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: shadow-gate-input
+          path: gate-input.json
+          retention-days: 1
+
+      - name: Log shadow notice
+        run: |
+          echo "================================================================"
+          echo "This is a non-blocking shadow smoke check."
+          echo "It does not approve code."
+          echo "It does not write review.json."
+          echo "It is not a Required Check."
+          echo "================================================================"
+
+  shadow-gate:
+    needs:
+      - prepare-gate-input
+    uses: shunhang776/xinbaijin-governance/.github/workflows/reusable-final-gate-shadow.yml@d640c388e7fcdf96b6e750d14994950fc7be50dc
+    with:
+      gate_input_artifact_name: shadow-gate-input
+      expected_policy_result: denied
+      governance_ref: d640c388e7fcdf96b6e750d14994950fc7be50dc
+      github_app_id: ${{ vars.BAIJIN_GOVERNANCE_READER_APP_ID }}
+    secrets:
+      github_app_private_key: ${{ secrets.BAIJIN_GOVERNANCE_READER_PRIVATE_KEY }}
+    permissions:
+      contents: read
+      actions: read
