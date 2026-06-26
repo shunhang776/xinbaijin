@@ -2,13 +2,20 @@
     "protocol":  "xinbaijin-review/1.0",
     "repository":  "shunhang776/xinbaijin",
     "branch":  "dev",
-    "reviewed_commit":  "3a330e73c4663a27c198f2ac3d78e9670ea48f0c",
-    "based_on_branch_head":  "3a330e73c4663a27c198f2ac3d78e9670ea48f0c",
-    "verdict":  "approved",
-    "summary":  "Phase 4-D negative dry-run validation: intentionally stale approved review to verify denied behavior.",
+    "reviewed_commit":  "6af22df96d5e5cc43437b452d6448aff339a7bde",
+    "based_on_branch_head":  "6af22df96d5e5cc43437b452d6448aff339a7bde",
+    "verdict":  "changes_requested",
+    "summary":  "Phase 4-E negative validation: intentionally changes_requested to verify denied behavior.",
     "findings":  [
-
+                     {
+                         "severity":  "medium",
+                         "file":  "docs/PHASE4E-NEGATIVE-CHANGES_REQUESTED-20260626-144405.md",
+                         "line":  1,
+                         "title":  "Intentional changes_requested negative finding",
+                         "description":  "This finding is intentionally created to verify denied behavior.",
+                         "recommendation":  "No production action. This is a controlled Phase 4-E negative validation case."
+                     }
                  ],
-    "reviewer":  "ChatGPT",
-    "reviewed_at":  "2026-06-26T04:59:57.000Z"
+    "reviewer":  "Phase4E Harness",
+    "reviewed_at":  "2026-06-26T06:44:09.000Z"
 }
