@@ -1,21 +1,21 @@
 {
-  "protocol": "xinbaijin-review/1.0",
-  "repository": "shunhang776/xinbaijin",
-  "branch": "dev",
-  "reviewed_commit": "3e0f2b7f83f03d1d9f9bdff9277c0fd40f537c2b",
-  "based_on_branch_head": "3e0f2b7f83f03d1d9f9bdff9277c0fd40f537c2b",
-  "verdict": "blocked",
-  "summary": "Phase 4-D negative dry-run validation: intentionally blocked to verify denied behavior.",
-  "findings": [
-    {
-      "severity": "high",
-      "file": "docs/PHASE4D-NEGATIVE-BLOCKED-20260626-123747.md",
-      "line": 1,
-      "title": "Intentional blocked negative dry-run finding",
-      "description": "This finding is intentionally created to verify that blocked is classified as denied by real-review-shadow and production-gate dry-run.",
-      "recommendation": "No production action. This is a controlled Phase 4-D negative validation case."
-    }
-  ],
-  "reviewer": "ChatGPT",
-  "reviewed_at": "2026-06-26T04:45:46.000Z"
+    "protocol":  "xinbaijin-review/1.0",
+    "repository":  "shunhang776/xinbaijin",
+    "branch":  "dev",
+    "reviewed_commit":  "3e0f2b7f83f03d1d9f9bdff9277c0fd40f537c2b",
+    "based_on_branch_head":  "3e0f2b7f83f03d1d9f9bdff9277c0fd40f537c2b",
+    "verdict":  "blocked",
+    "summary":  "Phase 4-D negative dry-run validation: intentionally blocked to verify denied behavior.",
+    "findings":  [
+                     {
+                         "severity":  "high",
+                         "file":  "docs/PHASE4D-NEGATIVE-BLOCKED-20260626-123747.md",
+                         "line":  1,
+                         "title":  "Intentional blocked negative dry-run finding",
+                         "description":  "This finding is intentionally created to verify that blocked is classified as denied by real-review-shadow and production-gate dry-run.",
+                         "recommendation":  "No production action. This is a controlled Phase 4-D negative validation case."
+                     }
+                 ],
+    "reviewer":  "ChatGPT",
+    "reviewed_at":  "2026-06-26T04:53:04.000Z"
 }
