@@ -16,7 +16,7 @@ permissions:
 
 env:
   CI: "true"
-  GOVERNANCE_SHA: bf7199f7a6a048744b4b53ce6b287a642915d9f5
+  GOVERNANCE_SHA: cc50fa6a0cf6d3944924432807e57d0ccb722464
 
 jobs:
   prepare-real-review-gate-input:
@@ -298,11 +298,11 @@ jobs:
   real-review-shadow-gate:
     needs:
       - prepare-real-review-gate-input
-    uses: shunhang776/xinbaijin-governance/.github/workflows/reusable-final-gate-shadow.yml@bf7199f7a6a048744b4b53ce6b287a642915d9f5
+    uses: shunhang776/xinbaijin-governance/.github/workflows/reusable-final-gate-shadow.yml@cc50fa6a0cf6d3944924432807e57d0ccb722464
     with:
       gate_input_artifact_name: real-review-gate-input
       expected_policy_result: ${{ needs.prepare-real-review-gate-input.outputs.expected_policy_result }}
-      governance_ref: bf7199f7a6a048744b4b53ce6b287a642915d9f5
+      governance_ref: cc50fa6a0cf6d3944924432807e57d0ccb722464
       github_app_id: ${{ vars.BAIJIN_GOVERNANCE_READER_APP_ID }}
     secrets:
       github_app_private_key: ${{ secrets.BAIJIN_GOVERNANCE_READER_PRIVATE_KEY }}
@@ -314,9 +314,9 @@ jobs:
     name: production-gate-dry-run
     needs:
       - prepare-real-review-gate-input
-    uses: shunhang776/xinbaijin-governance/.github/workflows/reusable-final-gate-dry-run.yml@bf7199f7a6a048744b4b53ce6b287a642915d9f5
+    uses: shunhang776/xinbaijin-governance/.github/workflows/reusable-final-gate-dry-run.yml@cc50fa6a0cf6d3944924432807e57d0ccb722464
     with:
-      governance_ref: bf7199f7a6a048744b4b53ce6b287a642915d9f5
+      governance_ref: cc50fa6a0cf6d3944924432807e57d0ccb722464
       gate_input_artifact_name: real-review-gate-input
       github_app_id: ${{ vars.BAIJIN_GOVERNANCE_READER_APP_ID }}
     secrets:
