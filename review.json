@@ -2,20 +2,20 @@
     "protocol":  "xinbaijin-review/1.0",
     "repository":  "shunhang776/xinbaijin",
     "branch":  "dev",
-    "reviewed_commit":  "49eaddff15c11364a7dadae53e4c01fff91eef7d",
-    "based_on_branch_head":  "49eaddff15c11364a7dadae53e4c01fff91eef7d",
+    "reviewed_commit":  "8d97b7fbbd652f441e464a1f41ea400013150b0f",
+    "based_on_branch_head":  "8d97b7fbbd652f441e464a1f41ea400013150b0f",
     "verdict":  "changes_requested",
-    "summary":  "Phase 4-E negative validation: intentionally changes_requested to verify denied behavior.",
+    "summary":  "Phase 5D enforced gate validation: intentionally denied to verify production-gate failure.",
     "findings":  [
                      {
                          "severity":  "medium",
-                         "file":  "docs/PHASE4E-NEGATIVE-CHANGES_REQUESTED-20260626-154045.md",
-                         "line":  1,
-                         "title":  "Intentional changes_requested negative finding",
-                         "description":  "This finding is intentionally created to verify denied behavior.",
-                         "recommendation":  "No production action. This is a controlled Phase 4-E negative validation case."
+                         "file":  ".github/workflows/baijin-real-review-shadow.yml",
+                         "line":  328,
+                         "title":  "Intentional Phase 5D denial",
+                         "description":  "This finding is intentionally created to verify enforced production gate denial behavior.",
+                         "recommendation":  "No production action. This is a controlled Phase 5D validation case."
                      }
                  ],
     "reviewer":  "ChatGPT",
-    "reviewed_at":  "2026-06-26T07:40:50.000Z"
+    "reviewed_at":  "2026-06-26T09:04:25.801Z"
 }
