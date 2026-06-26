@@ -2,20 +2,20 @@
   "protocol": "xinbaijin-review/1.0",
   "repository": "shunhang776/xinbaijin",
   "branch": "dev",
-  "reviewed_commit": "d52df477a781f64cba6ea35732bb83f22c010fc3",
-  "based_on_branch_head": "d52df477a781f64cba6ea35732bb83f22c010fc3",
-  "verdict": "changes_requested",
-  "summary": "Phase 4-D negative dry-run validation: intentionally changes_requested to verify denied behavior.",
+  "reviewed_commit": "3e0f2b7f83f03d1d9f9bdff9277c0fd40f537c2b",
+  "based_on_branch_head": "3e0f2b7f83f03d1d9f9bdff9277c0fd40f537c2b",
+  "verdict": "blocked",
+  "summary": "Phase 4-D negative dry-run validation: intentionally blocked to verify denied behavior.",
   "findings": [
     {
-      "severity": "medium",
-      "file": "docs/PHASE4D-NEGATIVE-CHANGES-REQUESTED-20260626-123432.md",
+      "severity": "high",
+      "file": "docs/PHASE4D-NEGATIVE-BLOCKED-20260626-123747.md",
       "line": 1,
-      "title": "Intentional negative dry-run finding",
-      "description": "This finding is intentionally created to verify that changes_requested is classified as denied by real-review-shadow and production-gate dry-run.",
+      "title": "Intentional blocked negative dry-run finding",
+      "description": "This finding is intentionally created to verify that blocked is classified as denied by real-review-shadow and production-gate dry-run.",
       "recommendation": "No production action. This is a controlled Phase 4-D negative validation case."
     }
   ],
   "reviewer": "ChatGPT",
-  "reviewed_at": "2026-06-26T04:34:36.000Z"
+  "reviewed_at": "2026-06-26T04:45:46.000Z"
 }
