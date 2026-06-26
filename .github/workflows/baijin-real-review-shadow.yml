@@ -227,14 +227,21 @@ jobs:
           });
 
           const normalizedChecks = normalizeCheckRuns(checksForGovernance);
+          const requiredCheckNames = ["static-checks"];
+          const ignoredGateCheckNames = new Set([
+            "prepare-real-review-gate-input",
+            "real-review-shadow-gate",
+            "production-gate-dry-run",
+            "production-gate",
+            "shadow-gate",
+            "dry-run-gate"
+          ]);
           const matchingChecks = normalizedChecks.filter(function(c) {
-            return c.commit_sha === candidateCommit;
+            return c.commit_sha === candidateCommit &&
+              requiredCheckNames.includes(c.name) &&
+              !ignoredGateCheckNames.has(c.name);
           });
-          console.log("Check runs matching candidate: " + matchingChecks.length);
-
-          const requiredCheckNames = matchingChecks.length > 0
-            ? [...new Set(matchingChecks.map(function(c) { return c.name; }))]
-            : ["baijin/build-test"];
+          console.log("Required check runs matching candidate: " + matchingChecks.length);
 
           // 9. Assemble evidence and build gate-input
           const evidence = {
