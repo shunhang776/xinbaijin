@@ -16,7 +16,7 @@ permissions:
 
 env:
   CI: "true"
-  GOVERNANCE_SHA: cc50fa6a0cf6d3944924432807e57d0ccb722464
+  GOVERNANCE_SHA: b5f4b2facbf747033416226a8cb92369ed0a4dec
 
 jobs:
   prepare-real-review-gate-input:
@@ -298,11 +298,11 @@ jobs:
   real-review-shadow-gate:
     needs:
       - prepare-real-review-gate-input
-    uses: shunhang776/xinbaijin-governance/.github/workflows/reusable-final-gate-shadow.yml@cc50fa6a0cf6d3944924432807e57d0ccb722464
+    uses: shunhang776/xinbaijin-governance/.github/workflows/reusable-final-gate-shadow.yml@b5f4b2facbf747033416226a8cb92369ed0a4dec
     with:
       gate_input_artifact_name: real-review-gate-input
       expected_policy_result: ${{ needs.prepare-real-review-gate-input.outputs.expected_policy_result }}
-      governance_ref: cc50fa6a0cf6d3944924432807e57d0ccb722464
+      governance_ref: b5f4b2facbf747033416226a8cb92369ed0a4dec
       github_app_id: ${{ vars.BAIJIN_GOVERNANCE_READER_APP_ID }}
     secrets:
       github_app_private_key: ${{ secrets.BAIJIN_GOVERNANCE_READER_PRIVATE_KEY }}
@@ -314,9 +314,24 @@ jobs:
     name: production-gate-dry-run
     needs:
       - prepare-real-review-gate-input
-    uses: shunhang776/xinbaijin-governance/.github/workflows/reusable-final-gate-dry-run.yml@cc50fa6a0cf6d3944924432807e57d0ccb722464
+    uses: shunhang776/xinbaijin-governance/.github/workflows/reusable-final-gate-dry-run.yml@b5f4b2facbf747033416226a8cb92369ed0a4dec
     with:
-      governance_ref: cc50fa6a0cf6d3944924432807e57d0ccb722464
+      governance_ref: b5f4b2facbf747033416226a8cb92369ed0a4dec
+      gate_input_artifact_name: real-review-gate-input
+      github_app_id: ${{ vars.BAIJIN_GOVERNANCE_READER_APP_ID }}
+    secrets:
+      github_app_private_key: ${{ secrets.BAIJIN_GOVERNANCE_READER_PRIVATE_KEY }}
+    permissions:
+      contents: read
+      actions: read
+
+  production-gate:
+    name: production-gate
+    needs:
+      - prepare-real-review-gate-input
+    uses: shunhang776/xinbaijin-governance/.github/workflows/reusable-final-gate-enforced.yml@b5f4b2facbf747033416226a8cb92369ed0a4dec
+    with:
+      governance_ref: b5f4b2facbf747033416226a8cb92369ed0a4dec
       gate_input_artifact_name: real-review-gate-input
       github_app_id: ${{ vars.BAIJIN_GOVERNANCE_READER_APP_ID }}
     secrets:
